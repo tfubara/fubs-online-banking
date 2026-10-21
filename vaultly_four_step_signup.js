@@ -1,20 +1,10 @@
 'use strict';
-
 /*
-  FUBS ONLINE BANKING
-  Demo banking application: backend + frontend in one file.
-  Requires Node.js 22.5 or newer.
-
-  Run:
-  node --no-warnings vaultly_four_step_signup.js
-
-  Open:
-  http://localhost:3000
-
-  IMPORTANT:
-  This is a demonstration application, not a real bank.
+  FUBS ONLINE BANKING: demo banking app in ONE file (back end + front end).
+  Needs Node.js 22.5 or newer. No npm install. Demo banking app.
+  Run: node --no-warnings vaultly_four_step_signup.js
+  Then open http://localhost:3000
 */
-
 const http = require('node:http');
 const path = require('node:path');
 const fs = require('node:fs');
@@ -23,3431 +13,2041 @@ const { DatabaseSync } = require('node:sqlite');
 
 /* ================= DATABASE ================= */
 
-fs.mkdirSync(path.join(__dirname, 'data'), {
-  recursive: true
-});
-
-const db = new DatabaseSync(
-  path.join(__dirname, 'data', 'bank-v2.db')
-);
-
+fs.mkdirSync(path.join(__dirname, 'data'), { recursive: true });
+const db = new DatabaseSync(path.join(__dirname, 'data', 'bank-v2.db'));
+db.exec('PRAGMA journal_mode = WAL; PRAGMA foreign_keys = ON;');
 db.exec(`
-PRAGMA journal_mode = WAL;
-PRAGMA foreign_keys = ON;
-
 CREATE TABLE IF NOT EXISTS users (
   id INTEGER PRIMARY KEY AUTOINCREMENT,
-  phone TEXT NOT NULL UNIQUE,
-  email TEXT NOT NULL UNIQUE,
-  password_hash TEXT NOT NULL,
-  pin_hash TEXT NOT NULL,
-  first_name TEXT NOT NULL,
-  middle_name TEXT NOT NULL DEFAULT '',
-  last_name TEXT NOT NULL,
-  dob TEXT NOT NULL,
-  gender TEXT NOT NULL DEFAULT '',
-  address TEXT NOT NULL,
-  city TEXT NOT NULL DEFAULT '',
-  state TEXT NOT NULL DEFAULT '',
-  country TEXT NOT NULL DEFAULT 'Nigeria',
-  occupation TEXT NOT NULL DEFAULT '',
-  source_of_funds TEXT NOT NULL DEFAULT '',
-  account_purpose TEXT NOT NULL DEFAULT '',
-  next_of_kin TEXT NOT NULL DEFAULT '',
-  next_of_kin_phone TEXT NOT NULL DEFAULT '',
+  phone TEXT NOT NULL UNIQUE, email TEXT NOT NULL UNIQUE,
+  password_hash TEXT NOT NULL, pin_hash TEXT NOT NULL,
+  first_name TEXT NOT NULL, middle_name TEXT NOT NULL DEFAULT '',
+  last_name TEXT NOT NULL, dob TEXT NOT NULL, gender TEXT NOT NULL DEFAULT '',
+  address TEXT NOT NULL, city TEXT NOT NULL DEFAULT '', state TEXT NOT NULL DEFAULT '',
+  country TEXT NOT NULL DEFAULT 'Nigeria', occupation TEXT NOT NULL DEFAULT '',
+  source_of_funds TEXT NOT NULL DEFAULT '', account_purpose TEXT NOT NULL DEFAULT '',
+  next_of_kin TEXT NOT NULL DEFAULT '', next_of_kin_phone TEXT NOT NULL DEFAULT '',
   face_capture_completed INTEGER NOT NULL DEFAULT 0,
   created_at TEXT NOT NULL DEFAULT (datetime('now'))
 );
-
 CREATE TABLE IF NOT EXISTS accounts (
-  user_id INTEGER PRIMARY KEY REFERENCES users(id),
+  user_id        INTEGER PRIMARY KEY REFERENCES users(id),
   account_number TEXT NOT NULL UNIQUE,
-  balance INTEGER NOT NULL DEFAULT 0 CHECK (balance >= 0),
-  savings INTEGER NOT NULL DEFAULT 0 CHECK (savings >= 0)
+  balance        INTEGER NOT NULL DEFAULT 0 CHECK (balance >= 0),
+  savings        INTEGER NOT NULL DEFAULT 0 CHECK (savings >= 0)
 );
-
 CREATE TABLE IF NOT EXISTS transactions (
-  id INTEGER PRIMARY KEY AUTOINCREMENT,
-  user_id INTEGER NOT NULL REFERENCES users(id),
-  type TEXT NOT NULL,
-  direction TEXT NOT NULL,
-  amount INTEGER NOT NULL,
+  id            INTEGER PRIMARY KEY AUTOINCREMENT,
+  user_id       INTEGER NOT NULL REFERENCES users(id),
+  type          TEXT NOT NULL,
+  direction     TEXT NOT NULL,
+  amount        INTEGER NOT NULL,
   balance_after INTEGER NOT NULL,
-  counterparty TEXT NOT NULL DEFAULT '',
-  description TEXT NOT NULL DEFAULT '',
-  reference TEXT NOT NULL,
-  created_at TEXT NOT NULL DEFAULT (datetime('now'))
+  counterparty  TEXT NOT NULL DEFAULT '',
+  description   TEXT NOT NULL DEFAULT '',
+  reference     TEXT NOT NULL,
+  created_at    TEXT NOT NULL DEFAULT (datetime('now'))
 );
-
-CREATE INDEX IF NOT EXISTS idx_tx_user
-ON transactions(user_id, id DESC);
+CREATE INDEX IF NOT EXISTS idx_tx_user ON transactions(user_id, id DESC);
 `);
-
-/* ================= TRANSACTION SAFETY ================= */
 
 function tx(fn) {
   db.exec('BEGIN IMMEDIATE');
-
   try {
-    const result = fn();
+    const r = fn();
     db.exec('COMMIT');
-    return result;
-  } catch (error) {
+    return r;
+  } catch (e) {
     db.exec('ROLLBACK');
-    throw error;
+    throw e;
   }
 }
 
-/* ================= CONFIGURATION ================= */
+/* ================= BACK END ================= */
 
 const PORT = process.env.PORT || 3000;
-
-const SECRET =
-  process.env.JWT_SECRET ||
-  crypto.randomBytes(32).toString('hex');
+const SECRET = process.env.JWT_SECRET || crypto.randomBytes(32).toString('hex');
 
 if (!process.env.JWT_SECRET) {
-  console.warn(
-    'Warning: JWT_SECRET is not configured. Sessions may reset after restart.'
-  );
+  console.warn('! JWT_SECRET not set: using a random one (logins reset on restart).');
 }
 
 const DEMO_TOPUP = process.env.DEMO_TOPUP !== 'false';
-
+const REQUIRE_PHONE_MATCH = process.env.REQUIRE_PHONE_MATCH !== 'false';
 const MAX_TX_NAIRA = 5_000_000;
 
-/* ================= ERROR HANDLING ================= */
+/* ---------- helpers ---------- */
 
 class HttpError extends Error {
-  constructor(status, message) {
-    super(message);
+  constructor(status, msg) {
+    super(msg);
     this.status = status;
   }
 }
 
-/* ================= SECURITY HELPERS ================= */
+const b64 = (b) => Buffer.from(b).toString('base64url');
+const hmac = (s, k = SECRET) =>
+  crypto.createHmac('sha256', k).update(s).digest('base64url');
 
-const b64 = (value) =>
-  Buffer.from(value).toString('base64url');
-
-const hmac = (value, key = SECRET) =>
-  crypto
-    .createHmac('sha256', key)
-    .update(value)
-    .digest('base64url');
-
-function signToken(userId) {
-  const payload = b64(
-    JSON.stringify({
-      uid: userId,
-      exp: Date.now() + 7 * 86400000
-    })
-  );
-
-  return `${payload}.${hmac(payload)}`;
+function signToken(uid) {
+  const body = b64(JSON.stringify({
+    uid,
+    exp: Date.now() + 7 * 864e5
+  }));
+  return `${body}.${hmac(body)}`;
 }
 
-function verifyToken(token) {
-  try {
-    const [payload, signature] = String(token || '').split('.');
+function verifyToken(t) {
+  const [body, sig] = String(t || '').split('.');
+  if (!body || !sig) return null;
 
-    if (!payload || !signature) {
-      return null;
-    }
+  const good = hmac(body);
 
-    const expected = hmac(payload);
-
-    const actualBuffer = Buffer.from(signature);
-    const expectedBuffer = Buffer.from(expected);
-
-    if (
-      actualBuffer.length !== expectedBuffer.length ||
-      !crypto.timingSafeEqual(actualBuffer, expectedBuffer)
-    ) {
-      return null;
-    }
-
-    const data = JSON.parse(
-      Buffer.from(payload, 'base64url').toString()
-    );
-
-    if (data.exp <= Date.now()) {
-      return null;
-    }
-
-    return data.uid;
-  } catch {
+  if (
+    sig.length !== good.length ||
+    !crypto.timingSafeEqual(Buffer.from(sig), Buffer.from(good))
+  ) {
     return null;
   }
+
+  const p = JSON.parse(Buffer.from(body, 'base64url').toString());
+  return p.exp > Date.now() ? p.uid : null;
 }
 
-function hashPassword(password) {
+function hashPassword(pw) {
   const salt = crypto.randomBytes(16);
-
-  const hash = crypto.scryptSync(
-    password,
-    salt,
-    64
-  );
-
-  return `${salt.toString('hex')}:${hash.toString('hex')}`;
+  return `${salt.toString('hex')}:${crypto.scryptSync(pw, salt, 64).toString('hex')}`;
 }
 
-function checkPassword(password, stored) {
-  try {
-    const [salt, savedHash] = stored.split(':');
-
-    const calculatedHash = crypto.scryptSync(
-      password,
-      Buffer.from(salt, 'hex'),
-      64
-    );
-
-    const savedBuffer = Buffer.from(savedHash, 'hex');
-
-    return (
-      calculatedHash.length === savedBuffer.length &&
-      crypto.timingSafeEqual(calculatedHash, savedBuffer)
-    );
-  } catch {
-    return false;
-  }
+function checkPassword(pw, stored) {
+  const [salt, hash] = stored.split(':');
+  const h = crypto.scryptSync(pw, Buffer.from(salt, 'hex'), 64);
+  return crypto.timingSafeEqual(h, Buffer.from(hash, 'hex'));
 }
 
-function referenceNumber() {
-  return (
-    'TX' +
-    Date.now().toString(36).toUpperCase() +
-    crypto.randomBytes(3).toString('hex').toUpperCase()
-  );
-}
+const ref = () =>
+  'TX' + Date.now().toString(36).toUpperCase() +
+  crypto.randomBytes(3).toString('hex').toUpperCase();
 
-/* ================= PHONE VALIDATION ================= */
+function normPhone(p) {
+  let s = String(p || '').replace(/[\s-]/g, '');
 
-function normalizePhone(phone) {
-  let value = String(phone || '').replace(/[\s-]/g, '');
-
-  if (value.startsWith('+234')) {
-    value = '0' + value.slice(4);
-  } else if (
-    value.startsWith('234') &&
-    value.length === 13
-  ) {
-    value = '0' + value.slice(3);
+  if (s.startsWith('+234')) {
+    s = '0' + s.slice(4);
+  } else if (s.startsWith('234') && s.length === 13) {
+    s = '0' + s.slice(3);
   }
 
-  return /^0[789][01]\d{8}$/.test(value)
-    ? value
-    : null;
+  return /^0[789][01]\d{8}$/.test(s) ? s : null;
 }
 
-/* ================= AGE CALCULATION ================= */
+function ageFrom(dob) {
+  const d = new Date(dob);
+  const n = new Date();
 
-function calculateAge(dob) {
-  const birthDate = new Date(dob);
-  const today = new Date();
+  let a = n.getFullYear() - d.getFullYear();
 
-  let age = today.getFullYear() - birthDate.getFullYear();
-
-  const birthdayHasNotOccurred =
-    today.getMonth() < birthDate.getMonth() ||
-    (
-      today.getMonth() === birthDate.getMonth() &&
-      today.getDate() < birthDate.getDate()
-    );
-
-  if (birthdayHasNotOccurred) {
-    age--;
+  if (n < new Date(n.getFullYear(), d.getMonth(), d.getDate())) {
+    a--;
   }
 
-  return age;
+  return a;
 }
 
-/* ================= MONEY FORMATTING ================= */
-
-// Store amounts in integer kobo to avoid floating-point money errors.
-
-function formatMoney(kobo) {
-  return new Intl.NumberFormat('en-NG', {
-    style: 'currency',
-    currency: 'NGN',
-    minimumFractionDigits: 2,
-    maximumFractionDigits: 2
-  }).format(Number(kobo) / 100);
-}
-
-function toKobo(value) {
-  const raw = String(value ?? '')
-    .trim()
-    .replace(/,/g, '');
+function toKobo(v) {
+  const raw = String(v ?? '').trim().replace(/,/g, '');
 
   if (!/^\d+(?:\.\d{1,2})?$/.test(raw)) {
-    throw new HttpError(
-      400,
-      'Enter a valid amount, using no more than two decimal places.'
-    );
+    throw new HttpError(400, 'Enter a valid amount (up to 2 decimal places).');
   }
 
   const [whole, fraction = ''] = raw.split('.');
-
   const naira = Number(whole);
 
-  if (
-    !Number.isSafeInteger(naira) ||
-    naira <= 0
-  ) {
-    throw new HttpError(
-      400,
-      'Enter an amount greater than zero.'
-    );
+  if (!Number.isSafeInteger(naira) || naira <= 0) {
+    throw new HttpError(400, 'Enter an amount greater than zero.');
   }
 
   if (
     naira > MAX_TX_NAIRA ||
-    (
-      naira === MAX_TX_NAIRA &&
-      Number(fraction) > 0
-    )
+    (naira === MAX_TX_NAIRA && Number(fraction) > 0)
   ) {
     throw new HttpError(
       400,
-      `Maximum demo transaction is ₦${MAX_TX_NAIRA.toLocaleString('en-NG')}.00`
+      `Maximum per transaction is ₦${MAX_TX_NAIRA.toLocaleString('en-NG')}.00`
     );
   }
 
-  return (
-    naira * 100 +
-    Number((fraction + '00').slice(0, 2))
-  );
+  return naira * 100 + Number((fraction + '00').slice(0, 2));
 }
 
-/* ================= ACCOUNT NUMBERS ================= */
+function profile(uid) {
+  const u = db.prepare(`
+    SELECT u.*, a.account_number, a.balance, a.savings
+    FROM users u
+    JOIN accounts a ON a.user_id = u.id
+    WHERE u.id = ?
+  `).get(uid);
+
+  if (!u) return null;
+
+  return {
+    id: u.id,
+    fullName: [u.first_name, u.middle_name, u.last_name].filter(Boolean).join(' '),
+    firstName: u.first_name,
+    dob: u.dob,
+    age: ageFrom(u.dob),
+    gender: u.gender,
+    address: u.address,
+    city: u.city,
+    state: u.state,
+    country: u.country,
+    occupation: u.occupation,
+    sourceOfFunds: u.source_of_funds,
+    accountPurpose: u.account_purpose,
+    nextOfKin: u.next_of_kin,
+    nextOfKinPhone: u.next_of_kin_phone,
+    faceCaptureCompleted: Boolean(u.face_capture_completed),
+    phone: u.phone,
+    email: u.email,
+    accountNumber: u.account_number,
+    balance: u.balance,
+    savings: u.savings
+  };
+}
 
 function newAccountNumber() {
   for (;;) {
-    const number =
-      '30' +
-      String(crypto.randomInt(0, 100000000))
-        .padStart(8, '0');
+    const n = '30' + String(crypto.randomInt(0, 1e8)).padStart(8, '0');
 
-    const exists = db.prepare(
-      'SELECT 1 FROM accounts WHERE account_number = ?'
-    ).get(number);
-
-    if (!exists) {
-      return number;
+    if (!db.prepare('SELECT 1 FROM accounts WHERE account_number=?').get(n)) {
+      return n;
     }
   }
 }
 
-/* ================= CUSTOMER PROFILE ================= */
+/* in-memory rate limiter */
 
-function getProfile(userId) {
-  const user = db.prepare(`
-    SELECT
-      u.*,
-      a.account_number,
-      a.balance,
-      a.savings
-    FROM users u
-    JOIN accounts a ON a.user_id = u.id
-    WHERE u.id = ?
-  `).get(userId);
+const hits = new Map();
 
-  if (!user) {
-    return null;
-  }
-
-  return {
-    id: user.id,
-
-    fullName: [
-      user.first_name,
-      user.middle_name,
-      user.last_name
-    ].filter(Boolean).join(' '),
-
-    firstName: user.first_name,
-    middleName: user.middle_name,
-    lastName: user.last_name,
-
-    dob: user.dob,
-    age: calculateAge(user.dob),
-    gender: user.gender,
-
-    phone: user.phone,
-    email: user.email,
-
-    address: user.address,
-    city: user.city,
-    state: user.state,
-    country: user.country,
-
-    occupation: user.occupation,
-    sourceOfFunds: user.source_of_funds,
-    accountPurpose: user.account_purpose,
-
-    nextOfKin: user.next_of_kin,
-    nextOfKinPhone: user.next_of_kin_phone,
-
-    faceCaptureCompleted:
-      Boolean(user.face_capture_completed),
-
-    accountNumber: user.account_number,
-
-    // Amounts are returned in kobo.
-    balance: user.balance,
-    savings: user.savings,
-
-    formattedBalance: formatMoney(user.balance),
-    formattedSavings: formatMoney(user.savings)
-  };
-}
-
-/* ================= RATE LIMITING ================= */
-
-const requestHits = new Map();
-
-function limitRequests(key, maximum, duration) {
+function limit(key, n, ms) {
   const now = Date.now();
+  const arr = (hits.get(key) || []).filter((t) => now - t < ms);
 
-  const recent = (
-    requestHits.get(key) || []
-  ).filter((time) => now - time < duration);
+  arr.push(now);
+  hits.set(key, arr);
 
-  recent.push(now);
-  requestHits.set(key, recent);
-
-  if (recent.length > maximum) {
-    throw new HttpError(
-      429,
-      'Too many attempts. Please wait and try again.'
-    );
+  if (arr.length > n) {
+    throw new HttpError(429, 'Too many attempts. Please wait and try again.');
   }
 }
 
 setInterval(() => {
   const now = Date.now();
 
-  for (const [key, times] of requestHits) {
-    if (!times.some((time) => now - time < 3600000)) {
-      requestHits.delete(key);
+  for (const [k, v] of hits) {
+    if (!v.some((t) => now - t < 36e5)) {
+      hits.delete(k);
     }
   }
-}, 600000).unref();
+}, 6e5).unref();
 
-/* ================= API ROUTES ================= */
+/* ---------- route handlers ---------- */
 
 const routes = {};
 
-function route(method, url, requiresAuth, handler) {
-  routes[`${method} ${url}`] = {
-    requiresAuth,
-    handler
-  };
-}
+const route = (method, p, auth, fn) => {
+  routes[`${method} ${p}`] = { auth, fn };
+};
 
-/* ================= REGISTRATION ================= */
+route('POST', '/api/auth/register', false, async ({ body, ip }) => {
+  limit('reg:' + ip, 10, 36e5);
 
-route(
-  'POST',
-  '/api/auth/register',
-  false,
-  async ({ body, ip }) => {
-    limitRequests('register:' + ip, 10, 3600000);
+  const firstName = String(body.firstName || '').trim();
+  const middleName = String(body.middleName || '').trim();
+  const lastName = String(body.lastName || '').trim();
+  const dob = String(body.dob || '').trim();
+  const gender = String(body.gender || '').trim();
+  const phone = normPhone(body.phone);
 
-    const firstName = String(body.firstName || '').trim();
-    const middleName = String(body.middleName || '').trim();
-    const lastName = String(body.lastName || '').trim();
+  const email = String(body.email || '').trim().toLowerCase();
+  const password = String(body.password || '');
+  const pin = String(body.pin || '');
 
-    const dob = String(body.dob || '').trim();
-    const gender = String(body.gender || '').trim();
+  const address = String(body.address || '').trim();
+  const city = String(body.city || '').trim();
+  const state = String(body.state || '').trim();
+  const country = String(body.country || 'Nigeria').trim();
+  const occupation = String(body.occupation || '').trim();
 
-    const phone = normalizePhone(body.phone);
+  const sourceOfFunds = String(body.sourceOfFunds || '').trim();
+  const accountPurpose = String(body.accountPurpose || '').trim();
 
-    const email = String(body.email || '')
-      .trim()
-      .toLowerCase();
+  const nextOfKin = String(body.nextOfKin || '').trim();
+  const nextOfKinPhone = normPhone(body.nextOfKinPhone);
 
-    const password = String(body.password || '');
-    const pin = String(body.pin || '');
-
-    const address = String(body.address || '').trim();
-    const city = String(body.city || '').trim();
-    const state = String(body.state || '').trim();
-
-    const country = String(body.country || 'Nigeria').trim();
-
-    const occupation = String(body.occupation || '').trim();
-
-    const sourceOfFunds =
-      String(body.sourceOfFunds || '').trim();
-
-    const accountPurpose =
-      String(body.accountPurpose || '').trim();
-
-    const nextOfKin =
-      String(body.nextOfKin || '').trim();
-
-    const nextOfKinPhone =
-      normalizePhone(body.nextOfKinPhone);
-
-    if (!firstName || !lastName || !dob || !gender) {
-      throw new HttpError(
-        400,
-        'Complete all required personal information.'
-      );
-    }
-
-    if (!phone) {
-      throw new HttpError(
-        400,
-        'Enter a valid Nigerian phone number.'
-      );
-    }
-
-    if (!/^[^\s@]+@[^\s@]+\.[^\s@]+$/.test(email)) {
-      throw new HttpError(
-        400,
-        'Enter a valid email address.'
-      );
-    }
-
-    if (
-      !address ||
-      !city ||
-      !state ||
-      !country ||
-      !occupation ||
-      !sourceOfFunds ||
-      !accountPurpose ||
-      !nextOfKin ||
-      !nextOfKinPhone
-    ) {
-      throw new HttpError(
-        400,
-        'Complete all required contact and profile fields.'
-      );
-    }
-
-    if (
-      password.length < 10 ||
-      !/[A-Za-z]/.test(password) ||
-      !/\d/.test(password)
-    ) {
-      throw new HttpError(
-        400,
-        'Password must be at least 10 characters and include letters and numbers.'
-      );
-    }
-
-    if (!/^\d{4,6}$/.test(pin)) {
-      throw new HttpError(
-        400,
-        'Transaction PIN must contain 4 to 6 digits.'
-      );
-    }
-
-    if (body.faceCaptureCompleted !== true) {
-      throw new HttpError(
-        400,
-        'Complete the camera selfie step before creating the demo account.'
-      );
-    }
-
-    if (
-      !/^\d{4}-\d{2}-\d{2}$/.test(dob) ||
-      Number.isNaN(Date.parse(dob)) ||
-      calculateAge(dob) < 18
-    ) {
-      throw new HttpError(
-        403,
-        'You must be at least 18 years old to open this demo account.'
-      );
-    }
-
-    const duplicate = db.prepare(`
-      SELECT 1
-      FROM users
-      WHERE phone = ? OR email = ?
-    `).get(phone, email);
-
-    if (duplicate) {
-      throw new HttpError(
-        409,
-        'An account already exists with this phone number or email.'
-      );
-    }
-
-    const userId = tx(() => {
-      const result = db.prepare(`
-        INSERT INTO users (
-          phone,
-          email,
-          password_hash,
-          pin_hash,
-          first_name,
-          middle_name,
-          last_name,
-          dob,
-          gender,
-          address,
-          city,
-          state,
-          country,
-          occupation,
-          source_of_funds,
-          account_purpose,
-          next_of_kin,
-          next_of_kin_phone,
-          face_capture_completed
-        )
-        VALUES (
-          ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, 1
-        )
-      `).run(
-        phone,
-        email,
-        hashPassword(password),
-        hashPassword(pin),
-        firstName,
-        middleName,
-        lastName,
-        dob,
-        gender,
-        address,
-        city,
-        state,
-        country,
-        occupation,
-        sourceOfFunds,
-        accountPurpose,
-        nextOfKin,
-        nextOfKinPhone
-      );
-
-      db.prepare(`
-        INSERT INTO accounts (
-          user_id,
-          account_number
-        )
-        VALUES (?, ?)
-      `).run(
-        result.lastInsertRowid,
-        newAccountNumber()
-      );
-
-      return Number(result.lastInsertRowid);
-    });
-
-    return {
-      status: 201,
-      data: {
-        token: signToken(userId),
-        user: getProfile(userId)
-      }
-    };
+  if (!firstName || !lastName || !dob || !gender) {
+    throw new HttpError(400, 'Complete all required personal information.');
   }
-);
 
-/* ================= LOGIN ================= */
+  if (!phone) {
+    throw new HttpError(400, 'Enter a valid Nigerian phone number.');
+  }
 
-route(
-  'POST',
-  '/api/auth/login',
-  false,
-  async ({ body, ip }) => {
-    limitRequests('login:' + ip, 15, 15 * 60000);
+  if (!/^[^\s@]+@[^\s@]+\.[^\s@]+$/.test(email)) {
+    throw new HttpError(400, 'Enter a valid email address.');
+  }
 
-    const identifier = String(body.identifier || '')
-      .trim()
-      .toLowerCase();
+  if (
+    !address || !city || !state || !country ||
+    !occupation || !sourceOfFunds || !accountPurpose ||
+    !nextOfKin || !nextOfKinPhone
+  ) {
+    throw new HttpError(400, 'Complete all required contact and profile fields.');
+  }
 
-    const user = db.prepare(`
-      SELECT *
-      FROM users
-      WHERE email = ? OR phone = ?
-    `).get(
-      identifier,
-      normalizePhone(identifier) || '__none__'
+  if (
+    password.length < 10 ||
+    !/[A-Za-z]/.test(password) ||
+    !/\d/.test(password)
+  ) {
+    throw new HttpError(
+      400,
+      'Password must be at least 10 characters and include letters and numbers.'
     );
+  }
 
-    if (
-      !user ||
-      !checkPassword(
-        String(body.password || ''),
-        user.password_hash
+  if (!/^\d{4,6}$/.test(pin)) {
+    throw new HttpError(400, 'Transaction PIN must contain 4 to 6 digits.');
+  }
+
+  if (body.faceCaptureCompleted !== true) {
+    throw new HttpError(400, 'Complete the camera selfie step before creating the demo account.');
+  }
+
+  if (
+    !/^\d{4}-\d{2}-\d{2}$/.test(dob) ||
+    Number.isNaN(Date.parse(dob)) ||
+    ageFrom(dob) < 18
+  ) {
+    throw new HttpError(403, 'You must be at least 18 years old to open this demo account.');
+  }
+
+  if (db.prepare('SELECT 1 FROM users WHERE phone=? OR email=?').get(phone, email)) {
+    throw new HttpError(409, 'An account already exists with this phone number or email.');
+  }
+
+  const uid = tx(() => {
+    const r = db.prepare(`
+      INSERT INTO users (
+        phone, email, password_hash, pin_hash,
+        first_name, middle_name, last_name, dob, gender,
+        address, city, state, country, occupation,
+        source_of_funds, account_purpose, next_of_kin, next_of_kin_phone,
+        face_capture_completed
       )
-    ) {
-      throw new HttpError(
-        401,
-        'Incorrect login details.'
-      );
-    }
-
-    return {
-      data: {
-        token: signToken(user.id),
-        user: getProfile(user.id)
-      }
-    };
-  }
-);
-
-/* ================= CURRENT CUSTOMER ================= */
-
-route(
-  'GET',
-  '/api/me',
-  true,
-  ({ userId }) => ({
-    data: getProfile(userId)
-  })
-);
-
-/* ================= TRANSACTION HISTORY ================= */
-
-route(
-  'GET',
-  '/api/transactions',
-  true,
-  ({ userId, query }) => {
-    const requestedLimit = Number(query.get('limit')) || 50;
-
-    const limit = Math.min(
-      Math.max(requestedLimit, 1),
-      200
+      VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,1)
+    `).run(
+      phone, email, hashPassword(password), hashPassword(pin),
+      firstName, middleName, lastName, dob, gender,
+      address, city, state, country, occupation,
+      sourceOfFunds, accountPurpose, nextOfKin, nextOfKinPhone
     );
 
-    const transactions = db.prepare(`
-      SELECT
-        id,
-        type,
-        direction,
-        amount,
-        balance_after,
-        counterparty,
-        description,
-        reference,
-        created_at
+    db.prepare(
+      'INSERT INTO accounts (user_id, account_number) VALUES (?,?)'
+    ).run(r.lastInsertRowid, newAccountNumber());
+
+    return Number(r.lastInsertRowid);
+  });
+
+  return {
+    status: 201,
+    data: { token: signToken(uid), user: profile(uid) }
+  };
+});
+
+route('POST', '/api/auth/login', false, async ({ body, ip }) => {
+  limit('login:' + ip, 15, 15 * 6e4);
+
+  const id = String(body.identifier || '').trim().toLowerCase();
+
+  const u = db.prepare(
+    'SELECT * FROM users WHERE email=? OR phone=?'
+  ).get(id, normPhone(id) || '__none__');
+
+  if (!u || !checkPassword(String(body.password || ''), u.password_hash)) {
+    throw new HttpError(401, 'Incorrect login details');
+  }
+
+  return {
+    data: { token: signToken(u.id), user: profile(u.id) }
+  };
+});
+
+route('GET', '/api/me', true, ({ uid }) => ({
+  data: profile(uid)
+}));
+
+route('GET', '/api/transactions', true, ({ uid, query }) => {
+  const lim = Math.min(Number(query.get('limit')) || 50, 200);
+
+  return {
+    data: db.prepare(`
+      SELECT id, type, direction, amount, balance_after,
+             counterparty, description, reference, created_at
       FROM transactions
-      WHERE user_id = ?
+      WHERE user_id=?
       ORDER BY id DESC
       LIMIT ?
-    `).all(userId, limit);
+    `).all(uid, lim)
+  };
+});
 
-    return {
-      data: transactions.map((item) => ({
-        ...item,
-        formattedAmount: formatMoney(item.amount),
-        formattedBalance: formatMoney(item.balance_after)
-      }))
-    };
+/* Paystack Nigerian bank list and account-name resolution.
+   Keep PAYSTACK_SECRET_KEY on the server, never in browser code. */
+
+route('GET', '/api/banks', true, async () => {
+  const key = process.env.PAYSTACK_SECRET_KEY;
+
+  if (!key) {
+    throw new HttpError(
+      503,
+      'Bank lookup is not configured yet. Add PAYSTACK_SECRET_KEY to your server environment.'
+    );
   }
-);
 
-/* ================= ACCOUNT NUMBER LOOKUP ================= */
-
-// Searches the database for the recipient's account number.
-// Only returns the account name and account number.
-
-route(
-  'GET',
-  '/api/lookup',
-  true,
-  ({ query }) => {
-    const accountNumber = String(
-      query.get('account') || ''
-    ).trim();
-
-    if (!/^\d{10}$/.test(accountNumber)) {
-      throw new HttpError(
-        400,
-        'Enter a valid 10-digit account number.'
-      );
+  const response = await fetch(
+    'https://api.paystack.co/bank?country=nigeria&perPage=100',
+    {
+      headers: {
+        Authorization: `Bearer ${key}`,
+        Accept: 'application/json'
+      }
     }
+  );
 
-    const recipient = db.prepare(`
-      SELECT
-        a.account_number,
-        u.first_name,
-        u.middle_name,
-        u.last_name
+  const result = await response.json().catch(() => ({}));
+
+  if (!response.ok || !result.status || !Array.isArray(result.data)) {
+    throw new HttpError(502, result.message || 'Could not retrieve the Nigerian bank list.');
+  }
+
+  return {
+    data: result.data
+      .filter(b => b.code && b.name)
+      .map(b => ({ name: b.name, code: String(b.code) }))
+  };
+});
+
+route('GET', '/api/resolve-account', true, async ({ query, uid }) => {
+  limit('bankresolve:' + uid, 30, 60 * 1000);
+
+  const key = process.env.PAYSTACK_SECRET_KEY;
+
+  if (!key) {
+    throw new HttpError(
+      503,
+      'Bank lookup is not configured yet. Add PAYSTACK_SECRET_KEY to your server environment.'
+    );
+  }
+
+  const accountNumber = String(query.get('accountNumber') || '').trim();
+  const bankCode = String(query.get('bankCode') || '').trim();
+
+  if (!/^\d{10}$/.test(accountNumber)) {
+    throw new HttpError(400, 'Account number must contain exactly 10 digits.');
+  }
+
+  if (!/^[A-Za-z0-9_-]{2,20}$/.test(bankCode)) {
+    throw new HttpError(400, 'Select a valid bank.');
+  }
+
+  const url = new URL('https://api.paystack.co/bank/resolve');
+  url.searchParams.set('account_number', accountNumber);
+  url.searchParams.set('bank_code', bankCode);
+
+  const response = await fetch(url, {
+    headers: {
+      Authorization: `Bearer ${key}`,
+      Accept: 'application/json'
+    }
+  });
+
+  const result = await response.json().catch(() => ({}));
+
+  if (!response.ok || !result.status || !result.data?.account_name) {
+    throw new HttpError(
+      422,
+      result.message || 'Paystack could not verify that account. Check the bank and account number.'
+    );
+  }
+
+  return {
+    data: {
+      account: {
+        accountNumber: String(result.data.account_number || accountNumber),
+        accountName: String(result.data.account_name),
+        bankCode
+      }
+    }
+  };
+});
+
+route('GET', '/api/lookup', true, ({ uid, query }) => {
+  limit('lookup:' + uid, 60, 60 * 1000);
+
+  const acct = String(query.get('account') || '').trim();
+
+  if (!/^\d{10}$/.test(acct)) {
+    throw new HttpError(400, 'Account number must be 10 digits');
+  }
+
+  const r = db.prepare(`
+    SELECT u.first_name, u.middle_name, u.last_name
+    FROM accounts a
+    JOIN users u ON u.id = a.user_id
+    WHERE a.account_number=?
+  `).get(acct);
+
+  if (!r) {
+    throw new HttpError(404, 'No Fubs demo account found with that number');
+  }
+
+  return {
+    data: {
+      name: [r.first_name, r.middle_name, r.last_name].filter(Boolean).join(' '),
+      accountNumber: acct,
+      bankName: 'Fubs Online Banking'
+    }
+  };
+});
+
+route('POST', '/api/topup', true, ({ uid, body }) => {
+  if (!DEMO_TOPUP) {
+    throw new HttpError(501, 'Funding requires a payment gateway integration');
+  }
+
+  const amt = toKobo(body.amount);
+
+  tx(() => {
+    db.prepare('UPDATE accounts SET balance=balance+? WHERE user_id=?').run(amt, uid);
+
+    const bal = db.prepare(
+      'SELECT balance FROM accounts WHERE user_id=?'
+    ).get(uid).balance;
+
+    db.prepare(`
+      INSERT INTO transactions
+      (user_id,type,direction,amount,balance_after,counterparty,description,reference)
+      VALUES (?,?,?,?,?,?,?,?)
+    `).run(
+      uid, 'topup', 'credit', amt, bal,
+      'Wallet funding', 'Add money (demo)', ref()
+    );
+  });
+
+  return { data: profile(uid) };
+});
+
+route('POST', '/api/transfer', true, ({ uid, body }) => {
+  limit('xfer:' + uid, 30, 6e4);
+
+  const amt = toKobo(body.amount);
+  const to = String(body.accountNumber || '');
+  const note = String(body.note || '').slice(0, 100);
+
+  tx(() => {
+    const me = db.prepare(
+      'SELECT * FROM accounts WHERE user_id=?'
+    ).get(uid);
+
+    const dest = db.prepare(`
+      SELECT a.*, u.first_name, u.last_name
       FROM accounts a
-      JOIN users u ON u.id = a.user_id
-      WHERE a.account_number = ?
-    `).get(accountNumber);
+      JOIN users u ON u.id=a.user_id
+      WHERE a.account_number=?
+    `).get(to);
 
-    if (!recipient) {
-      throw new HttpError(
-        404,
-        'Account not found. Check the account number.'
-      );
+    if (!dest) {
+      throw new HttpError(404, 'Recipient account not found');
     }
 
-    return {
-      data: {
-        accountNumber: recipient.account_number,
-        name: [
-          recipient.first_name,
-          recipient.middle_name,
-          recipient.last_name
-        ].filter(Boolean).join(' '),
-        bankName: 'Fubs Online Banking'
-      }
-    };
-  }
-);
-
-/* ================= DEMO DEPOSIT ================= */
-
-// This simulates funding a demo account.
-// It does not charge a card or receive real money.
-
-route(
-  'POST',
-  '/api/topup',
-  true,
-  ({ userId, body }) => {
-    if (!DEMO_TOPUP) {
-      throw new HttpError(
-        501,
-        'Real funding requires an authorised payment gateway.'
-      );
+    if (dest.user_id === uid) {
+      throw new HttpError(400, 'You cannot transfer to yourself');
     }
 
-    const amount = toKobo(body.amount);
-    const reference = referenceNumber();
+    if (me.balance < amt) {
+      throw new HttpError(400, 'Insufficient balance');
+    }
 
-    tx(() => {
-      const account = db.prepare(`
-        SELECT balance
-        FROM accounts
-        WHERE user_id = ?
-      `).get(userId);
+    const sender = db.prepare(
+      'SELECT first_name,last_name FROM users WHERE id=?'
+    ).get(uid);
 
-      if (!account) {
-        throw new HttpError(
-          404,
-          'Account not found.'
-        );
-      }
+    const r = ref();
 
-      db.prepare(`
-        UPDATE accounts
-        SET balance = balance + ?
-        WHERE user_id = ?
-      `).run(amount, userId);
+    db.prepare(
+      'UPDATE accounts SET balance=balance-? WHERE user_id=?'
+    ).run(amt, uid);
 
-      const updated = db.prepare(`
-        SELECT balance
-        FROM accounts
-        WHERE user_id = ?
-      `).get(userId);
+    db.prepare(
+      'UPDATE accounts SET balance=balance+? WHERE user_id=?'
+    ).run(amt, dest.user_id);
 
-      db.prepare(`
-        INSERT INTO transactions (
-          user_id,
-          type,
-          direction,
-          amount,
-          balance_after,
-          counterparty,
-          description,
-          reference
-        )
-        VALUES (?, ?, ?, ?, ?, ?, ?, ?)
-      `).run(
-        userId,
-        'deposit',
-        'credit',
-        amount,
-        updated.balance,
-        'Demo funding',
-        'Simulated account funding',
-        reference
-      );
-    });
+    const insert = db.prepare(`
+      INSERT INTO transactions
+      (user_id,type,direction,amount,balance_after,counterparty,description,reference)
+      VALUES (?,?,?,?,?,?,?,?)
+    `);
 
-    return {
-      data: getProfile(userId),
-      message: 'Demo funding completed.',
-      reference
-    };
-  }
-);
-
-/* ================= INTERNAL TRANSFERS ================= */
-
-// Transfers money between two registered demo accounts.
-// Both account updates and transaction records are committed
-// together so that a failed transfer does not partially complete.
-
-route(
-  'POST',
-  '/api/transfer',
-  true,
-  ({ userId, body }) => {
-    limitRequests(
-      'transfer:' + userId,
-      20,
-      60000
+    insert.run(
+      uid, 'transfer', 'debit', amt, me.balance - amt,
+      `${dest.first_name} ${dest.last_name}`, note || 'Transfer', r
     );
 
-    const accountNumber = String(
-      body.accountNumber || ''
-    ).trim();
-
-    const amount = toKobo(body.amount);
-
-    const note = String(
-      body.note || ''
-    ).trim().slice(0, 100);
-
-    const pin = String(body.pin || '');
-
-    if (!/^\d{10}$/.test(accountNumber)) {
-      throw new HttpError(
-        400,
-        'Enter a valid 10-digit recipient account number.'
-      );
-    }
-
-    if (!/^\d{4,6}$/.test(pin)) {
-      throw new HttpError(
-        400,
-        'Enter your transaction PIN.'
-      );
-    }
-
-    const senderUser = db.prepare(`
-      SELECT id, pin_hash
-      FROM users
-      WHERE id = ?
-    `).get(userId);
-
-    if (
-      !senderUser ||
-      !checkPassword(pin, senderUser.pin_hash)
-    ) {
-      throw new HttpError(
-        401,
-        'Incorrect transaction PIN.'
-      );
-    }
-
-    const reference = referenceNumber();
-
-    tx(() => {
-      const senderAccount = db.prepare(`
-        SELECT *
-        FROM accounts
-        WHERE user_id = ?
-      `).get(userId);
-
-      const recipient = db.prepare(`
-        SELECT
-          a.user_id,
-          a.account_number,
-          a.balance,
-          u.first_name,
-          u.middle_name,
-          u.last_name
-        FROM accounts a
-        JOIN users u ON u.id = a.user_id
-        WHERE a.account_number = ?
-      `).get(accountNumber);
-
-      if (!senderAccount) {
-        throw new HttpError(
-          404,
-          'Your account could not be found.'
-        );
-      }
-
-      if (!recipient) {
-        throw new HttpError(
-          404,
-          'Recipient account not found.'
-        );
-      }
-
-      if (recipient.user_id === userId) {
-        throw new HttpError(
-          400,
-          'You cannot transfer money to your own account.'
-        );
-      }
-
-      if (senderAccount.balance < amount) {
-        throw new HttpError(
-          400,
-          'Insufficient available balance.'
-        );
-      }
-
-      const recipientName = [
-        recipient.first_name,
-        recipient.middle_name,
-        recipient.last_name
-      ].filter(Boolean).join(' ');
-
-      const senderName = db.prepare(`
-        SELECT first_name, last_name
-        FROM users
-        WHERE id = ?
-      `).get(userId);
-
-      const senderAccountName =
-        `${senderName.first_name} ${senderName.last_name}`;
-
-      // Debit the sender.
-      db.prepare(`
-        UPDATE accounts
-        SET balance = balance - ?
-        WHERE user_id = ?
-      `).run(amount, userId);
-
-      // Credit the recipient.
-      db.prepare(`
-        UPDATE accounts
-        SET balance = balance + ?
-        WHERE user_id = ?
-      `).run(amount, recipient.user_id);
-
-      const senderBalance = db.prepare(`
-        SELECT balance
-        FROM accounts
-        WHERE user_id = ?
-      `).get(userId).balance;
-
-      const recipientBalance = db.prepare(`
-        SELECT balance
-        FROM accounts
-        WHERE user_id = ?
-      `).get(recipient.user_id).balance;
-
-      // Record the sender's debit.
-      db.prepare(`
-        INSERT INTO transactions (
-          user_id,
-          type,
-          direction,
-          amount,
-          balance_after,
-          counterparty,
-          description,
-          reference
-        )
-        VALUES (?, ?, ?, ?, ?, ?, ?, ?)
-      `).run(
-        userId,
-        'transfer',
-        'debit',
-        amount,
-        senderBalance,
-        recipientName,
-        note || 'Transfer to ' + recipientName,
-        reference
-      );
-
-      // Record the recipient's credit.
-      db.prepare(`
-        INSERT INTO transactions (
-          user_id,
-          type,
-          direction,
-          amount,
-          balance_after,
-          counterparty,
-          description,
-          reference
-        )
-        VALUES (?, ?, ?, ?, ?, ?, ?, ?)
-      `).run(
-        recipient.user_id,
-        'transfer',
-        'credit',
-        amount,
-        recipientBalance,
-        senderAccountName,
-        note || 'Transfer from ' + senderAccountName,
-        reference
-      );
-    });
-
-    return {
-      data: getProfile(userId),
-      message: 'Transfer successful.',
-      reference,
-      amount: amount,
-      formattedAmount: formatMoney(amount)
-    };
-  }
-);
-
-/* ================= SAVINGS ================= */
-
-// Moves money between the main balance and the savings balance.
-// This is an internal demo feature, not an interest-bearing deposit.
-
-route(
-  'POST',
-  '/api/save',
-  true,
-  ({ userId, body }) => {
-    const amount = toKobo(body.amount);
-
-    const direction = String(
-      body.direction || ''
-    ).toLowerCase();
-
-    if (!['save', 'withdraw'].includes(direction)) {
-      throw new HttpError(
-        400,
-        'Choose whether to save or withdraw.'
-      );
-    }
-
-    const reference = referenceNumber();
-
-    tx(() => {
-      const account = db.prepare(`
-        SELECT balance, savings
-        FROM accounts
-        WHERE user_id = ?
-      `).get(userId);
-
-      if (!account) {
-        throw new HttpError(
-          404,
-          'Account not found.'
-        );
-      }
-
-      let newBalance;
-      let newSavings;
-
-      if (direction === 'save') {
-        if (account.balance < amount) {
-          throw new HttpError(
-            400,
-            'Insufficient balance to save this amount.'
-          );
-        }
-
-        newBalance = account.balance - amount;
-        newSavings = account.savings + amount;
-      } else {
-        if (account.savings < amount) {
-          throw new HttpError(
-            400,
-            'Insufficient savings balance.'
-          );
-        }
-
-        newBalance = account.balance + amount;
-        newSavings = account.savings - amount;
-      }
-
-      db.prepare(`
-        UPDATE accounts
-        SET balance = ?, savings = ?
-        WHERE user_id = ?
-      `).run(
-        newBalance,
-        newSavings,
-        userId
-      );
-
-      db.prepare(`
-        INSERT INTO transactions (
-          user_id,
-          type,
-          direction,
-          amount,
-          balance_after,
-          counterparty,
-          description,
-          reference
-        )
-        VALUES (?, ?, ?, ?, ?, ?, ?, ?)
-      `).run(
-        userId,
-        direction === 'save' ? 'savings' : 'savings_withdrawal',
-        direction === 'save' ? 'debit' : 'credit',
-        amount,
-        newBalance,
-        'Fubs Savings',
-        direction === 'save'
-          ? 'Transfer to demo savings'
-          : 'Withdrawal from demo savings',
-        reference
-      );
-    });
-
-    return {
-      data: getProfile(userId),
-      message: direction === 'save'
-        ? 'Savings transfer completed.'
-        : 'Savings withdrawal completed.',
-      reference,
-      formattedAmount: formatMoney(amount)
-    };
-  }
-);
-
-/* ================= DEMO BILL PAYMENTS ================= */
-
-// Simulates a bill payment in the demo database.
-// It does not contact a real electricity, internet or TV provider.
-
-route(
-  'POST',
-  '/api/bills',
-  true,
-  ({ userId, body }) => {
-    const amount = toKobo(body.amount);
-
-    const category = String(
-      body.category || ''
-    ).trim().slice(0, 40);
-
-    const provider = String(
-      body.provider || ''
-    ).trim().slice(0, 60);
-
-    const target = String(
-      body.target || ''
-    ).trim().slice(0, 100);
-
-    if (!category || !provider || !target) {
-      throw new HttpError(
-        400,
-        'Enter the bill category, provider and customer reference.'
-      );
-    }
-
-    const reference = referenceNumber();
-
-    tx(() => {
-      const account = db.prepare(`
-        SELECT balance
-        FROM accounts
-        WHERE user_id = ?
-      `).get(userId);
-
-      if (!account) {
-        throw new HttpError(
-          404,
-          'Account not found.'
-        );
-      }
-
-      if (account.balance < amount) {
-        throw new HttpError(
-          400,
-          'Insufficient balance for this payment.'
-        );
-      }
-
-      db.prepare(`
-        UPDATE accounts
-        SET balance = balance - ?
-        WHERE user_id = ?
-      `).run(amount, userId);
-
-      const updated = db.prepare(`
-        SELECT balance
-        FROM accounts
-        WHERE user_id = ?
-      `).get(userId);
-
-      db.prepare(`
-        INSERT INTO transactions (
-          user_id,
-          type,
-          direction,
-          amount,
-          balance_after,
-          counterparty,
-          description,
-          reference
-        )
-        VALUES (?, ?, ?, ?, ?, ?, ?, ?)
-      `).run(
-        userId,
-        'bill',
-        'debit',
-        amount,
-        updated.balance,
-        provider,
-        `${category}: ${target}`,
-        reference
-      );
-    });
-
-    return {
-      data: getProfile(userId),
-      message: 'Demo bill payment completed.',
-      reference,
-      formattedAmount: formatMoney(amount)
-    };
-  }
-);
-/* ================= HTTP SERVER AND SECURITY ================= */
-
-function sendJson(res, statusCode, data) {
-    res.writeHead(statusCode, {
-        "Content-Type": "application/json; charset=utf-8",
-        "Cache-Control": "no-store",
-        "X-Content-Type-Options": "nosniff",
-        "X-Frame-Options": "DENY",
-        "Referrer-Policy": "no-referrer",
-        "Content-Security-Policy": "default-src 'self'; style-src 'self' 'unsafe-inline'; script-src 'self' 'unsafe-inline'; img-src 'self' data: blob:; connect-src 'self';"
-    });
-
-    res.end(JSON.stringify(data));
-}
-
-function readRequestBody(req) {
-    return new Promise((resolve, reject) => {
-        let rawBody = "";
-        let size = 0;
-        const maxSize = 1024 * 1024;
-
-        req.on("data", chunk => {
-            size += chunk.length;
-
-            if (size > maxSize) {
-                reject(new HttpError(413, "Request is too large."));
-                req.destroy();
-                return;
-            }
-
-            rawBody += chunk.toString("utf8");
-        });
-
-        req.on("end", () => {
-            if (!rawBody.trim()) {
-                resolve({});
-                return;
-            }
-
-            try {
-                resolve(JSON.parse(rawBody));
-            } catch {
-                reject(new HttpError(400, "Invalid JSON request."));
-            }
-        });
-
-        req.on("error", reject);
-    });
-}
-
-function getBearerToken(req) {
-    const authorization = req.headers.authorization || "";
-
-    if (!authorization.startsWith("Bearer ")) {
-        return null;
-    }
-
-    return authorization.slice(7).trim();
-}
-
-function sendHtml(res, html) {
-    res.writeHead(200, {
-        "Content-Type": "text/html; charset=utf-8",
-        "Cache-Control": "no-store",
-        "X-Content-Type-Options": "nosniff",
-        "X-Frame-Options": "DENY",
-        "Referrer-Policy": "no-referrer",
-        "Content-Security-Policy": "default-src 'self'; style-src 'self' 'unsafe-inline'; script-src 'self' 'unsafe-inline'; img-src 'self' data: blob:; connect-src 'self';"
-    });
-
-    res.end(html);
-}
-
-const server = http.createServer(async (req, res) => {
-    try {
-        const requestUrl = new URL(
-            req.url,
-            `http://${req.headers.host || "localhost"}`
-        );
-
-        const pathname = requestUrl.pathname;
-        const method = req.method.toUpperCase();
-
-        // Handle browser preflight requests.
-        if (method === "OPTIONS") {
-            res.writeHead(204, {
-                "Allow": "GET, POST, OPTIONS",
-                "Access-Control-Allow-Methods": "GET, POST, OPTIONS",
-                "Access-Control-Allow-Headers": "Content-Type, Authorization",
-                "Access-Control-Max-Age": "600",
-                "X-Content-Type-Options": "nosniff"
-            });
-
-            res.end();
-            return;
-        }
-
-        // Serve the frontend added in Part 4.
-        if (
-            method === "GET" &&
-            (pathname === "/" || pathname === "/index.html")
-        ) {
-            sendHtml(res, FRONTEND_HTML);
-            return;
-        }
-
-        // All other requests must match a registered API route.
-        if (!pathname.startsWith("/api/")) {
-            sendJson(res, 404, {
-                success: false,
-                message: "Page not found."
-            });
-            return;
-        }
-
-        const routeKey = `${method} ${pathname}`;
-        const selectedRoute = routes[routeKey];
-
-        if (!selectedRoute) {
-            sendJson(res, 404, {
-                success: false,
-                message: "API endpoint not found."
-            });
-            return;
-        }
-
-        // Read request data.
-        let body = {};
-
-        if (method === "POST" || method === "PUT" || method === "PATCH") {
-            const contentType = req.headers["content-type"] || "";
-
-            if (!contentType.toLowerCase().includes("application/json")) {
-                sendJson(res, 415, {
-                    success: false,
-                    message: "Content-Type must be application/json."
-                });
-                return;
-            }
-
-            body = await readRequestBody(req);
-        }
-
-        // Authenticate requests that require a logged-in user.
-        let userId = null;
-
-        if (selectedRoute.requiresAuth) {
-            const token = getBearerToken(req);
-
-            if (!token) {
-                sendJson(res, 401, {
-                    success: false,
-                    message: "Please log in to continue."
-                });
-                return;
-            }
-
-            userId = verifyToken(token);
-
-            if (!userId) {
-                sendJson(res, 401, {
-                    success: false,
-                    message: "Your session is invalid or has expired. Please log in again."
-                });
-                return;
-            }
-        }
-
-        // Execute the selected backend route.
-        const result = await selectedRoute.handler({
-            req,
-            res,
-            body,
-            userId,
-            query: Object.fromEntries(requestUrl.searchParams)
-        });
-
-        // A route can return its own response, for example after logging out.
-        if (res.writableEnded) {
-            return;
-        }
-
-        const statusCode =
-            result && Number.isInteger(result.status)
-                ? result.status
-                : 200;
-
-        const responseData =
-            result && typeof result === "object"
-                ? { ...result }
-                : { data: result };
-
-        delete responseData.status;
-
-        sendJson(res, statusCode, responseData);
-
-    } catch (error) {
-        if (res.writableEnded || res.destroyed) {
-            return;
-        }
-
-        const statusCode =
-            Number.isInteger(error.statusCode)
-                ? error.statusCode
-                : Number.isInteger(error.status)
-                    ? error.status
-                    : 500;
-
-        if (statusCode >= 500) {
-            console.error("Server error:", error);
-        }
-
-        sendJson(res, statusCode, {
-            success: false,
-            message:
-                statusCode >= 500
-                    ? "A server error occurred. Please try again later."
-                    : error.message || "The request could not be completed."
-        });
-    }
+    insert.run(
+      dest.user_id, 'transfer', 'credit', amt, dest.balance + amt,
+      `${sender.first_name} ${sender.last_name}`, note || 'Transfer', r
+    );
+  });
+
+  return { data: profile(uid) };
 });
 
-// Start the application.
-server.listen(PORT, "127.0.0.1", () => {
-    console.log("");
-    console.log("========================================");
-    console.log("       FUBS ONLINE BANKING");
-    console.log("========================================");
-    console.log(`Server running at http://127.0.0.1:${PORT}`);
-    console.log("Database: SQLite");
-    console.log("Mode: DEMO");
-    console.log("");
-    console.log("Press Ctrl + C to stop the server.");
-});
-/* ================= FUBS ONLINE BANKING FRONTEND ================= */
+route('POST', '/api/save', true, ({ uid, body }) => {
+  const amt = toKobo(body.amount);
+  const out = body.direction === 'out';
 
-const FRONTEND_HTML = String.raw`<!DOCTYPE html>
-<html lang="en">
+  tx(() => {
+    const a = db.prepare(
+      'SELECT * FROM accounts WHERE user_id=?'
+    ).get(uid);
+
+    if (out ? a.savings < amt : a.balance < amt) {
+      throw new HttpError(
+        400,
+        out ? 'Not enough in savings' : 'Insufficient balance'
+      );
+    }
+
+    const bal = a.balance + (out ? amt : -amt);
+
+    db.prepare(
+      'UPDATE accounts SET balance=?, savings=savings+? WHERE user_id=?'
+    ).run(bal, out ? -amt : amt, uid);
+
+    db.prepare(`
+      INSERT INTO transactions
+      (user_id,type,direction,amount,balance_after,counterparty,description,reference)
+      VALUES (?,?,?,?,?,?,?,?)
+    `).run(
+      uid, 'save', out ? 'credit' : 'debit', amt, bal,
+      'Savings',
+      out ? 'Withdrawn from savings' : 'Moved to savings',
+      ref()
+    );
+  });
+
+  return { data: profile(uid) };
+});
+
+const BILLS = {
+  airtime: 'Airtime',
+  data: 'Data',
+  tv: 'TV',
+  electricity: 'Electricity'
+};
+
+route('POST', '/api/bills', true, ({ uid, body }) => {
+  limit('bill:' + uid, 30, 6e4);
+
+  const cat = String(body.category || '');
+
+  if (!BILLS[cat]) {
+    throw new HttpError(400, 'Unknown bill category');
+  }
+
+  const provider = String(body.provider || '').slice(0, 40);
+  const target = String(body.target || '').replace(/[^\w-]/g, '').slice(0, 20);
+
+  if (!provider || !target) {
+    throw new HttpError(400, 'Provider and number are required');
+  }
+
+  const amt = toKobo(body.amount);
+
+  // Demo only. Real bill payment needs an aggregator API.
+  tx(() => {
+    const a = db.prepare(
+      'SELECT balance FROM accounts WHERE user_id=?'
+    ).get(uid);
+
+    if (a.balance < amt) {
+      throw new HttpError(400, 'Insufficient balance');
+    }
+
+    db.prepare(
+      'UPDATE accounts SET balance=balance-? WHERE user_id=?'
+    ).run(amt, uid);
+
+    db.prepare(`
+      INSERT INTO transactions
+      (user_id,type,direction,amount,balance_after,counterparty,description,reference)
+      VALUES (?,?,?,?,?,?,?,?)
+    `).run(
+      uid, 'bill', 'debit', amt, a.balance - amt,
+      provider, `${BILLS[cat]} - ${target}`, ref()
+    );
+  });
+
+  return { data: profile(uid) };
+});
+
+/* ================= FRONT END ================= */
+
+const INDEX_HTML = String.raw`<!doctype html>
+<html lang="en" data-theme="dark">
 <head>
-<meta charset="UTF-8">
-<meta name="viewport" content="width=device-width, initial-scale=1.0">
-<title>Fubs Online Banking</title>
-
-<style>
-:root {
-    --bg: #07111f;
-    --panel: #0d1b2e;
-    --panel2: #11233a;
-    --blue: #1685ff;
-    --blue2: #0066dd;
-    --text: #f4f7fb;
-    --muted: #9aabc0;
-    --border: #263c56;
-    --green: #20c997;
-    --red: #ff6878;
-}
-
-* {
-    box-sizing: border-box;
-}
-
-body {
-    margin: 0;
-    background: var(--bg);
-    color: var(--text);
-    font-family: Arial, Helvetica, sans-serif;
-    min-height: 100vh;
-}
-
-button, input, select, textarea {
-    font: inherit;
-}
-
-button {
-    cursor: pointer;
-}
-
-button:disabled {
-    opacity: .55;
-    cursor: not-allowed;
-}
-
-.hidden {
-    display: none !important;
-}
-
-.muted {
-    color: var(--muted);
-}
-
-.small {
-    font-size: 12px;
-    line-height: 1.6;
-}
-
-.topbar {
-    min-height: 76px;
-    display: flex;
-    align-items: center;
-    justify-content: space-between;
-    gap: 15px;
-    padding: 16px 5%;
-    border-bottom: 1px solid var(--border);
-    background: #081525;
-}
-
-.brand {
-    display: flex;
-    align-items: center;
-    gap: 12px;
-    font-weight: 800;
-    font-size: 19px;
-}
-
-.brand-icon {
-    display: grid;
-    place-items: center;
-    width: 43px;
-    height: 43px;
-    border-radius: 13px;
-    background: var(--blue);
-    color: white;
-    font-size: 22px;
-}
-
-.brand span:last-child {
-    color: var(--blue);
-}
-
-.container {
-    width: min(1150px, 92%);
-    margin: 30px auto;
-}
-
-.panel {
-    background: var(--panel);
-    border: 1px solid var(--border);
-    border-radius: 17px;
-    padding: 24px;
-    margin-bottom: 20px;
-}
-
-h1, h2, h3, p {
-    margin-top: 0;
-}
-
-h1 {
-    font-size: clamp(26px, 4vw, 38px);
-}
-
-h2 {
-    font-size: 21px;
-}
-
-h3 {
-    font-size: 16px;
-}
-
-.subtitle {
-    color: var(--muted);
-    line-height: 1.7;
-}
-
-.grid {
-    display: grid;
-    grid-template-columns: repeat(2, minmax(0, 1fr));
-    gap: 16px;
-}
-
-.grid-three {
-    display: grid;
-    grid-template-columns: repeat(3, minmax(0, 1fr));
-    gap: 16px;
-}
-
-label {
-    display: block;
-    margin-bottom: 7px;
-    font-size: 13px;
-    font-weight: 700;
-    color: #dce7f4;
-}
-
-input, select, textarea {
-    width: 100%;
-    padding: 13px 14px;
-    border-radius: 10px;
-    border: 1px solid var(--border);
-    background: #071525;
-    color: var(--text);
-    outline: none;
-}
-
-input:focus, select:focus, textarea:focus {
-    border-color: var(--blue);
-    box-shadow: 0 0 0 3px #1685ff20;
-}
-
-.field {
-    margin-bottom: 16px;
-    min-width: 0;
-}
-
-.btn {
-    border: 0;
-    border-radius: 10px;
-    padding: 13px 17px;
-    font-weight: 700;
-    transition: .2s;
-}
-
-.btn-primary {
-    background: var(--blue);
-    color: white;
-}
-
-.btn-primary:hover {
-    background: var(--blue2);
-}
-
-.btn-secondary {
-    background: var(--panel2);
-    color: var(--text);
-    border: 1px solid var(--border);
-}
-
-.btn-danger {
-    background: #692735;
-    color: white;
-}
-
-.btn-block {
-    width: 100%;
-}
-
-.btn-row {
-    display: flex;
-    gap: 10px;
-    flex-wrap: wrap;
-}
-
-.link-button {
-    border: none;
-    background: none;
-    color: #5eaeff;
-    cursor: pointer;
-    padding: 5px;
-    font-weight: 700;
-}
-
-.notice {
-    padding: 13px;
-    border-radius: 10px;
-    border: 1px solid var(--border);
-    background: #0a1727;
-    color: var(--muted);
-    line-height: 1.6;
-    font-size: 13px;
-    margin-bottom: 16px;
-}
-
-.message {
-    padding: 13px;
-    border-radius: 10px;
-    margin-bottom: 16px;
-    line-height: 1.5;
-}
-
-.message.success {
-    color: #8af0cf;
-    background: #0a302a;
-    border: 1px solid #17614d;
-}
-
-.message.error {
-    color: #ffb6bf;
-    background: #35151c;
-    border: 1px solid #71303b;
-}
-
-.message.info {
-    color: #b8d9ff;
-    background: #102b48;
-    border: 1px solid #254e79;
-}
-
-.tabs {
-    display: flex;
-    gap: 8px;
-    margin-bottom: 24px;
-    flex-wrap: wrap;
-}
-
-.tab {
-    border: 1px solid var(--border);
-    background: var(--panel2);
-    color: var(--muted);
-    border-radius: 9px;
-    padding: 11px 14px;
-}
-
-.tab.active {
-    color: white;
-    background: var(--blue2);
-    border-color: var(--blue);
-}
-
-.balance-panel {
-    background: linear-gradient(135deg, #0759b5, #102c62);
-    border: 1px solid #277de2;
-    border-radius: 18px;
-    padding: 25px;
-    min-height: 190px;
-    margin-bottom: 20px;
-}
-
-.balance-amount {
-    font-size: clamp(28px, 5vw, 42px);
-    font-weight: 800;
-    margin: 18px 0;
-    overflow-wrap: anywhere;
-}
-
-.account-number {
-    letter-spacing: 2px;
-    font-size: 18px;
-    font-weight: 700;
-}
-
-.stat {
-    background: var(--panel);
-    border: 1px solid var(--border);
-    padding: 19px;
-    border-radius: 14px;
-    min-width: 0;
-}
-
-.stat strong {
-    display: block;
-    font-size: 21px;
-    margin-top: 10px;
-    overflow-wrap: anywhere;
-}
-
-.action-grid {
-    display: grid;
-    grid-template-columns: repeat(2, minmax(0, 1fr));
-    gap: 20px;
-}
-
-.section {
-    display: none;
-}
-
-.section.active {
-    display: block;
-}
-
-.table-wrap {
-    width: 100%;
-    overflow-x: auto;
-}
-
-table {
-    width: 100%;
-    border-collapse: collapse;
-    min-width: 560px;
-}
-
-th, td {
-    padding: 14px 12px;
-    border-bottom: 1px solid var(--border);
-    text-align: left;
-    font-size: 13px;
-}
-
-th {
-    color: var(--muted);
-}
-
-.positive {
-    color: var(--green);
-}
-
-.negative {
-    color: var(--red);
-}
-
-footer {
-    text-align: center;
-    padding: 25px;
-    color: var(--muted);
-    font-size: 12px;
-}
-
-.camera-box {
-    border: 1px dashed #45627f;
-    padding: 15px;
-    border-radius: 12px;
-    margin-bottom: 16px;
-}
-
-#cameraVideo, #capturedImage {
-    width: 100%;
-    max-width: 400px;
-    display: block;
-    margin: 12px auto;
-    border-radius: 10px;
-    background: #03080f;
-}
-
-@media (max-width: 750px) {
-    .grid-three {
-        grid-template-columns: 1fr;
-    }
-
-    .grid, .action-grid {
-        grid-template-columns: 1fr;
-    }
-
-    .panel {
-        padding: 18px;
-    }
-
-    .topbar {
-        padding: 14px 4%;
-    }
-
-    .container {
-        margin-top: 20px;
-    }
-}
-</style>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1, viewport-fit=cover">
+  <meta name="theme-color" content="#05070d">
+  <title>Fubs Online Banking</title>
+  <link rel="stylesheet" href="/styles.css">
+  <script src="/theme.js"></script>
 </head>
-
 <body>
-
-<header class="topbar">
-    <div class="brand">
-        <div class="brand-icon">F</div>
-        <div>FUBS <span>ONLINE BANKING</span></div>
-    </div>
-
-    <div id="headerActions">
-        <button class="btn btn-secondary" id="headerLogin"
-                onclick="showAuth('login')">Login</button>
-    </div>
-</header>
-
-<main class="container">
-
-    <div id="globalMessage"></div>
-
-    <!-- LOGIN AND REGISTRATION -->
-
-    <section id="authView">
-
-        <div class="panel" id="welcomePanel">
-            <h1>Banking made simple.</h1>
-            <p class="subtitle">
-                Welcome to Fubs Online Banking. Manage your demo account,
-                explore transactions and practise digital banking.
-            </p>
-
-            <div class="notice">
-                DEMO APPLICATION: This website does not connect to real banks,
-                verify identity documents, or send real money.
-                Use fictional information only.
-            </div>
-        </div>
-
-        <div class="panel">
-            <div class="tabs">
-                <button class="tab active" id="loginTab"
-                        onclick="showAuth('login')">Login</button>
-
-                <button class="tab" id="registerTab"
-                        onclick="showAuth('register')">Create account</button>
-            </div>
-
-            <!-- LOGIN FORM -->
-
-            <form id="loginForm">
-                <h2>Welcome back</h2>
-                <p class="subtitle">Log in to your demo account.</p>
-
-                <div class="field">
-                    <label for="loginIdentifier">Email or phone number</label>
-                    <input id="loginIdentifier" required
-                           autocomplete="username"
-                           placeholder="Enter your email or phone">
-                </div>
-
-                <div class="field">
-                    <label for="loginPassword">Password</label>
-                    <input id="loginPassword" type="password" required
-                           autocomplete="current-password"
-                           placeholder="Enter your password">
-                </div>
-
-                <button class="btn btn-primary btn-block" type="submit">
-                    Login securely
-                </button>
-
-                <p class="small muted" style="margin-top:15px">
-                    New here?
-                    <button type="button" class="link-button"
-                            onclick="showAuth('register')">
-                        Create a demo account
-                    </button>
-                </p>
-            </form>
-
-            <!-- REGISTRATION FORM -->
-
-            <form id="registerForm" class="hidden">
-                <h2>Create your demo account</h2>
-                <p class="subtitle">
-                    Complete the following details to create an account.
-                </p>
-
-                <div class="notice">
-                    You must be at least 18 to use this demo registration flow.
-                    Do not enter a real NIN, real bank PIN, or sensitive identity
-                    information.
-                </div>
-
-                <h3>Step 1 — Personal information</h3>
-
-                <div class="grid">
-                    <div class="field">
-                        <label for="firstName">First name</label>
-                        <input id="firstName" required maxlength="60">
-                    </div>
-
-                    <div class="field">
-                        <label for="middleName">Middle name (optional)</label>
-                        <input id="middleName" maxlength="60">
-                    </div>
-
-                    <div class="field">
-                        <label for="lastName">Last name</label>
-                        <input id="lastName" required maxlength="60">
-                    </div>
-
-                    <div class="field">
-                        <label for="dob">Date of birth</label>
-                        <input id="dob" type="date" required>
-                    </div>
-
-                    <div class="field">
-                        <label for="gender">Gender</label>
-                        <select id="gender" required>
-                            <option value="">Select</option>
-                            <option value="Male">Male</option>
-                            <option value="Female">Female</option>
-                            <option value="Other">Other</option>
-                            <option value="Prefer not to say">Prefer not to say</option>
-                        </select>
-                    </div>
-
-                    <div class="field">
-                        <label for="occupation">Occupation</label>
-                        <input id="occupation" required maxlength="100">
-                    </div>
-                </div>
-
-                <h3>Step 2 — Contact information</h3>
-
-                <div class="grid">
-                    <div class="field">
-                        <label for="phone">Phone number</label>
-                        <input id="phone" type="tel" required
-                               autocomplete="tel"
-                               placeholder="e.g. 08012345678">
-                    </div>
-
-                    <div class="field">
-                        <label for="email">Email address</label>
-                        <input id="email" type="email" required
-                               autocomplete="email">
-                    </div>
-
-                    <div class="field">
-                        <label for="address">Address</label>
-                        <input id="address" required maxlength="200">
-                    </div>
-
-                    <div class="field">
-                        <label for="city">City or town</label>
-                        <input id="city" required maxlength="100">
-                    </div>
-
-                    <div class="field">
-                        <label for="state">State</label>
-                        <input id="state" required maxlength="100">
-                    </div>
-
-                    <div class="field">
-                        <label for="country">Country</label>
-                        <input id="country" value="Nigeria" required maxlength="100">
-                    </div>
-                </div>
-
-                <h3>Step 3 — Account information</h3>
-
-                <div class="grid">
-                    <div class="field">
-                        <label for="sourceOfFunds">Source of funds</label>
-                        <select id="sourceOfFunds" required>
-                            <option value="">Select source</option>
-                            <option value="Salary">Salary</option>
-                            <option value="Business">Business</option>
-                            <option value="Personal savings">Personal savings</option>
-                            <option value="Family support">Family support</option>
-                            <option value="Other">Other</option>
-                        </select>
-                    </div>
-
-                    <div class="field">
-                        <label for="accountPurpose">Purpose of account</label>
-                        <select id="accountPurpose" required>
-                            <option value="">Select purpose</option>
-                            <option value="Personal use">Personal use</option>
-                            <option value="Savings">Savings</option>
-                            <option value="Business use">Business use</option>
-                            <option value="School expenses">School expenses</option>
-                        </select>
-                    </div>
-
-                    <div class="field">
-                        <label for="nextOfKin">Next of kin name</label>
-                        <input id="nextOfKin" required maxlength="120">
-                    </div>
-
-                    <div class="field">
-                        <label for="nextOfKinPhone">Next of kin phone</label>
-                        <input id="nextOfKinPhone" type="tel" required>
-                    </div>
-                </div>
-
-                <h3>Step 4 — Security</h3>
-
-                <div class="grid">
-                    <div class="field">
-                        <label for="registerPassword">Create password</label>
-                        <input id="registerPassword" type="password"
-                               minlength="10" maxlength="128"
-                               autocomplete="new-password" required>
-                        <p class="small muted">
-                            Use at least 10 characters for this demo.
-                        </p>
-                    </div>
-
-                    <div class="field">
-                        <label for="confirmPassword">Confirm password</label>
-                        <input id="confirmPassword" type="password"
-                               minlength="10" maxlength="128"
-                               autocomplete="new-password" required>
-                    </div>
-
-                    <div class="field">
-                        <label for="registerPin">Create transaction PIN</label>
-                        <input id="registerPin" type="password"
-                               inputmode="numeric" pattern="[0-9]{4}"
-                               maxlength="4" required>
-                        <p class="small muted">Use a fictional 4-digit PIN.</p>
-                    </div>
-
-                    <div class="field">
-                        <label for="confirmPin">Confirm transaction PIN</label>
-                        <input id="confirmPin" type="password"
-                               inputmode="numeric" pattern="[0-9]{4}"
-                               maxlength="4" required>
-                    </div>
-                </div>
-
-                <div class="camera-box">
-                    <h3>Optional camera demonstration</h3>
-                    <p class="small muted">
-                        Camera access is optional. This demo does not verify
-                        your identity or perform genuine facial recognition.
-                        The registration API only receives a completion flag;
-                        it does not receive or verify a captured image.
-                    </p>
-
-                    <video id="cameraVideo" class="hidden"
-                           autoplay playsinline></video>
-
-                    <canvas id="cameraCanvas" class="hidden"></canvas>
-
-                    <img id="capturedImage" class="hidden" alt="Camera preview">
-
-                    <div class="btn-row">
-                        <button type="button" class="btn btn-secondary"
-                                id="startCameraButton">
-                            Start camera
-                        </button>
-
-                        <button type="button" class="btn btn-secondary hidden"
-                                id="captureButton">
-                            Capture preview
-                        </button>
-
-                        <button type="button" class="btn btn-secondary hidden"
-                                id="stopCameraButton">
-                            Stop camera
-                        </button>
-                    </div>
-
-                    <p id="cameraStatus" class="small muted">
-                        Camera not started.
-                    </p>
-                </div>
-
-                <label style="display:flex;gap:10px;align-items:flex-start;
-                              line-height:1.6;margin-bottom:20px">
-                    <input type="checkbox" id="terms" required
-                           style="width:auto;margin-top:4px">
-                    <span>
-                        I understand this is a demonstration application and
-                        I am using fictional information.
-                    </span>
-                </label>
-
-                <button class="btn btn-primary btn-block" type="submit">
-                    Create demo account
-                </button>
-
-                <p class="small muted" style="margin-top:15px">
-                    Already registered?
-                    <button type="button" class="link-button"
-                            onclick="showAuth('login')">Login</button>
-                </p>
-            </form>
-        </div>
-    </section>
-
-    <!-- DASHBOARD -->
-
-    <section id="dashboardView" class="hidden">
-
-        <div style="display:flex;justify-content:space-between;
-                    align-items:center;gap:15px;flex-wrap:wrap;margin-bottom:20px">
-            <div>
-                <h1 id="welcomeTitle">Welcome</h1>
-                <p class="subtitle">Your Fubs demo banking dashboard.</p>
-            </div>
-
-            <button class="btn btn-secondary" id="logoutButton">
-                Logout
-            </button>
-        </div>
-
-        <div class="balance-panel">
-            <p class="muted">Available demo balance</p>
-            <div class="balance-amount" id="balanceAmount">₦0.00</div>
-
-            <p class="muted">Demo account number</p>
-            <div class="account-number" id="accountNumber">----------</div>
-
-            <p style="margin-top:15px">
-                <span id="accountHolder">Account holder</span>
-            </p>
-        </div>
-
-        <div class="grid-three" style="margin-bottom:25px">
-            <div class="stat">
-                <span class="muted small">Account status</span>
-                <strong id="accountStatus">Demo</strong>
-            </div>
-
-            <div class="stat">
-                <span class="muted small">Savings balance</span>
-                <strong id="savingsAmount">₦0.00</strong>
-            </div>
-
-            <div class="stat">
-                <span class="muted small">Transactions</span>
-                <strong id="transactionCount">0</strong>
-            </div>
-        </div>
-
-        <div class="notice">
-            All balances and transactions displayed here belong to the local
-            demo database. Deposits are simulated and transfers only work
-            between accounts created in this same application.
-        </div>
-
-        <div class="tabs" id="dashboardTabs">
-            <button class="tab active" data-section="overview">Overview</button>
-            <button class="tab" data-section="transfer">Transfer</button>
-            <button class="tab" data-section="topup">Demo deposit</button>
-            <button class="tab" data-section="savings">Savings</button>
-            <button class="tab" data-section="bills">Bill payments</button>
-            <button class="tab" data-section="history">History</button>
-            <button class="tab" data-section="profile">Profile</button>
-        </div>
-
-        <!-- OVERVIEW -->
-
-        <section class="section active" id="section-overview">
-            <div class="panel">
-                <h2>Quick actions</h2>
-                <div class="action-grid">
-                    <button class="btn btn-primary"
-                            onclick="showSection('transfer')">
-                        Transfer money
-                    </button>
-
-                    <button class="btn btn-secondary"
-                            onclick="showSection('topup')">
-                        Add demo funds
-                    </button>
-
-                    <button class="btn btn-secondary"
-                            onclick="showSection('savings')">
-                        Manage savings
-                    </button>
-
-                    <button class="btn btn-secondary"
-                            onclick="showSection('history')">
-                        View transactions
-                    </button>
-                </div>
-            </div>
-
-            <div class="panel">
-                <h2>Recent transactions</h2>
-                <div id="recentTransactions">
-                    <p class="muted">Loading transactions...</p>
-                </div>
-            </div>
-        </section>
-
-        <!-- TRANSFER -->
-
-        <section class="section" id="section-transfer">
-            <div class="panel">
-                <h2>Transfer between demo accounts</h2>
-                <p class="subtitle">
-                    Send funds to another account registered in this application.
-                </p>
-
-                <div id="recipientMessage"></div>
-
-                <form id="lookupForm">
-                    <div class="field">
-                        <label for="recipientAccount">Recipient account number</label>
-                        <input id="recipientAccount" inputmode="numeric"
-                               maxlength="10" pattern="[0-9]{10}" required
-                               placeholder="Enter 10-digit account number">
-                    </div>
-
-                    <button class="btn btn-secondary" type="submit">
-                        Find account
-                    </button>
-                </form>
-
-                <div id="recipientDetails" class="notice hidden"
-                     style="margin-top:16px"></div>
-
-                <form id="transferForm" class="hidden"
-                      style="margin-top:20px">
-                    <div class="field">
-                        <label for="transferAmount">Amount (NGN)</label>
-                        <input id="transferAmount" type="text"
-                               inputmode="decimal" required
-                               placeholder="e.g. 5,000.00">
-                    </div>
-
-                    <div class="field">
-                        <label for="transferDescription">Description (optional)</label>
-                        <input id="transferDescription" maxlength="120"
-                               placeholder="e.g. Payment">
-                    </div>
-
-                    <div class="field">
-                        <label for="transferPin">Transaction PIN</label>
-                        <input id="transferPin" type="password"
-                               inputmode="numeric" pattern="[0-9]{4}"
-                               maxlength="4" required>
-                    </div>
-
-                    <button class="btn btn-primary btn-block" type="submit">
-                        Confirm demo transfer
-                    </button>
-                </form>
-            </div>
-        </section>
-
-        <!-- DEMO DEPOSIT -->
-
-        <section class="section" id="section-topup">
-            <div class="panel">
-                <h2>Add demo funds</h2>
-
-                <div class="notice">
-                    This feature creates simulated funds for testing.
-                    It does not charge a card, contact a bank, or receive real money.
-                </div>
-
-                <form id="topupForm">
-                    <div class="field">
-                        <label for="topupAmount">Amount (NGN)</label>
-                        <input id="topupAmount" type="text"
-                               inputmode="decimal" required
-                               placeholder="e.g. 10,000.00">
-                    </div>
-
-                    <button class="btn btn-primary btn-block" type="submit">
-                        Add demo funds
-                    </button>
-                </form>
-            </div>
-        </section>
-
-        <!-- SAVINGS -->
-
-        <section class="section" id="section-savings">
-            <div class="panel">
-                <h2>Manage savings</h2>
-                <p class="subtitle">
-                    Move funds between your demo balance and demo savings.
-                </p>
-
-                <form id="savingsForm">
-                    <div class="field">
-                        <label for="savingsDirection">Action</label>
-                        <select id="savingsDirection" required>
-                            <option value="save">Move money into savings</option>
-                            <option value="withdraw">Move money out of savings</option>
-                        </select>
-                    </div>
-
-                    <div class="field">
-                        <label for="savingsTransactionAmount">Amount (NGN)</label>
-                        <input id="savingsTransactionAmount" type="text"
-                               inputmode="decimal" required
-                               placeholder="e.g. 2,500.00">
-                    </div>
-
-                    <button class="btn btn-primary btn-block" type="submit">
-                        Confirm savings action
-                    </button>
-                </form>
-            </div>
-        </section>
-
-        <!-- BILLS -->
-
-        <section class="section" id="section-bills">
-            <div class="panel">
-                <h2>Demo bill payments</h2>
-
-                <div class="notice">
-                    Bill payments are simulated. No airtime, data, electricity
-                    units, or real-world services will be purchased.
-                </div>
-
-                <form id="billsForm">
-                    <div class="field">
-                        <label for="billCategory">Bill category</label>
-                        <select id="billCategory" required>
-                            <option value="">Select category</option>
-                            <option value="airtime">Airtime</option>
-                            <option value="data">Data</option>
-                            <option value="electricity">Electricity</option>
-                            <option value="cable">Cable TV</option>
-                        </select>
-                    </div>
-
-                    <div class="field">
-                        <label for="billProvider">Provider</label>
-                        <input id="billProvider" required maxlength="100"
-                               placeholder="e.g. Demo Provider">
-                    </div>
-
-                    <div class="field">
-                        <label for="billTarget">Phone number or customer reference</label>
-                        <input id="billTarget" required maxlength="120">
-                    </div>
-
-                    <div class="field">
-                        <label for="billAmount">Amount (NGN)</label>
-                        <input id="billAmount" type="text"
-                               inputmode="decimal" required
-                               placeholder="e.g. 1,500.00">
-                    </div>
-
-                    <button class="btn btn-primary btn-block" type="submit">
-                        Pay demo bill
-                    </button>
-                </form>
-            </div>
-        </section>
-
-        <!-- HISTORY -->
-
-        <section class="section" id="section-history">
-            <div class="panel">
-                <div style="display:flex;justify-content:space-between;
-                            align-items:center;gap:10px;flex-wrap:wrap">
-                    <h2>Transaction history</h2>
-                    <button class="btn btn-secondary"
-                            onclick="loadTransactions()">
-                        Refresh
-                    </button>
-                </div>
-
-                <div id="transactionHistory">
-                    <p class="muted">Loading history...</p>
-                </div>
-            </div>
-        </section>
-
-        <!-- PROFILE -->
-
-        <section class="section" id="section-profile">
-            <div class="panel">
-                <h2>Account profile</h2>
-                <div id="profileDetails"></div>
-            </div>
-        </section>
-
-    </section>
-
-</main>
-
-<footer>
-    Fubs Online Banking · Demonstration application only · No real banking services
-</footer>
-
-<script>
-(function () {
-    'use strict';
-
-    var token = sessionStorage.getItem('fubs_demo_token') || '';
-    var currentUser = null;
-    var currentRecipient = null;
-    var cameraStream = null;
-
-    var messageElement = document.getElementById('globalMessage');
-
-    function escapeHtml(value) {
-        return String(value == null ? '' : value).replace(/[&<>"']/g,
-            function (character) {
-                return {
-                    '&': '&amp;',
-                    '<': '&lt;',
-                    '>': '&gt;',
-                    '"': '&quot;',
-                    "'": '&#39;'
-                }[character];
-            });
-    }
-
-    function showMessage(message, type, target) {
-        var element = target || messageElement;
-
-        element.innerHTML =
-            '<div class="message ' + escapeHtml(type || 'info') + '">' +
-            escapeHtml(message) +
-            '</div>';
-    }
-
-    function clearMessage(target) {
-        (target || messageElement).innerHTML = '';
-    }
-
-    function unwrap(result) {
-        if (result && result.data !== undefined) {
-            return result.data;
-        }
-
-        return result;
-    }
-
-    async function api(url, options) {
-        options = options || {};
-
-        var headers = Object.assign({}, options.headers || {});
-
-        if (options.body !== undefined) {
-            headers['Content-Type'] = 'application/json';
-        }
-
-        if (token) {
-            headers.Authorization = 'Bearer ' + token;
-        }
-
-        var response;
-
-        try {
-            response = await fetch(url, Object.assign({}, options, {
-                headers: headers,
-                cache: 'no-store'
-            }));
-        } catch (error) {
-            throw new Error(
-                'Could not connect to the server. Check that your app is running.'
-            );
-        }
-
-        var result;
-
-        try {
-            result = await response.json();
-        } catch (error) {
-            throw new Error('The server returned an invalid response.');
-        }
-
-        if (!response.ok) {
-            throw new Error(
-                result.message || 'The request could not be completed.'
-            );
-        }
-
-        return result;
-    }
-
-    function money(value) {
-        var number = Number(value);
-
-        if (!Number.isFinite(number)) {
-            number = 0;
-        }
-
-        return new Intl.NumberFormat('en-NG', {
-            style: 'currency',
-            currency: 'NGN',
-            minimumFractionDigits: 2,
-            maximumFractionDigits: 2
-        }).format(number);
-    }
-
-    function formatAmountInput(input) {
-        var value = input.value.trim();
-
-        if (!value) {
-            return;
-        }
-
-        value = value.replace(/,/g, '');
-
-        if (!/^\d+(\.\d{0,2})?$/.test(value)) {
-            return;
-        }
-
-        var parts = value.split('.');
-        parts[0] = parts[0].replace(/\B(?=(\d{3})+(?!\d))/g, ',');
-
-        input.value = parts.join('.');
-    }
-
-    function getAmount(inputId) {
-        var value = document.getElementById(inputId).value.trim();
-        value = value.replace(/,/g, '');
-
-        if (!/^\d+(\.\d{1,2})?$/.test(value)) {
-            throw new Error('Enter a valid amount with no more than 2 decimal places.');
-        }
-
-        var amount = Number(value);
-
-        if (!Number.isFinite(amount) || amount <= 0) {
-            throw new Error('The amount must be greater than zero.');
-        }
-
-        if (amount > 100000000) {
-            throw new Error('The amount exceeds this demo limit.');
-        }
-
-        return amount.toFixed(2);
-    }
-
-    function showAuth(mode) {
-        document.getElementById('authView').classList.remove('hidden');
-        document.getElementById('dashboardView').classList.add('hidden');
-
-        document.getElementById('loginForm').classList.toggle(
-            'hidden', mode !== 'login'
-        );
-
-        document.getElementById('registerForm').classList.toggle(
-            'hidden', mode !== 'register'
-        );
-
-        document.getElementById('loginTab').classList.toggle(
-            'active', mode === 'login'
-        );
-
-        document.getElementById('registerTab').classList.toggle(
-            'active', mode === 'register'
-        );
-
-        clearMessage();
-    }
-
-    function showDashboard() {
-        document.getElementById('authView').classList.add('hidden');
-        document.getElementById('dashboardView').classList.remove('hidden');
-
-        document.getElementById('headerActions').innerHTML =
-            '<span class="small muted">Demo account</span>';
-
-        showSection('overview');
-    }
-
-    function showSection(name) {
-        document.querySelectorAll('.section').forEach(function (section) {
-            section.classList.remove('active');
-        });
-
-        document.querySelectorAll('#dashboardTabs .tab').forEach(function (tab) {
-            tab.classList.toggle('active', tab.dataset.section === name);
-        });
-
-        var section = document.getElementById('section-' + name);
-
-        if (section) {
-            section.classList.add('active');
-        }
-
-        clearMessage();
-
-        if (name === 'history') {
-            loadTransactions();
-        }
-
-        if (name === 'overview') {
-            loadTransactions();
-        }
-
-        if (name === 'profile') {
-            renderProfile();
-        }
-    }
-
-    function displayValue(object, keys) {
-        for (var i = 0; i < keys.length; i++) {
-            if (object && object[keys[i]] !== undefined &&
-                object[keys[i]] !== null) {
-                return object[keys[i]];
-            }
-        }
-
-        return '';
-    }
-
-    function updateDashboard(profile) {
-        currentUser = profile || {};
-
-        var account = currentUser.account || currentUser;
-
-        var firstName = displayValue(currentUser, ['firstName', 'first_name']);
-        var lastName = displayValue(currentUser, ['lastName', 'last_name']);
-        var fullName = displayValue(currentUser, [
-            'name', 'fullName', 'full_name'
-        ]);
-
-        if (!fullName) {
-            fullName = (firstName + ' ' + lastName).trim();
-        }
-
-        if (!fullName) {
-            fullName = 'Demo customer';
-        }
-
-        var balanceKobo = displayValue(account, [
-            'balanceKobo', 'balance_kobo'
-        ]);
-
-        var balanceNaira = displayValue(account, [
-            'balance', 'balanceNaira', 'balance_naira'
-        ]);
-
-        var savingsKobo = displayValue(account, [
-            'savingsKobo', 'savings_kobo'
-        ]);
-
-        var savingsNaira = displayValue(account, [
-            'savings', 'savingsBalance', 'savings_balance'
-        ]);
-
-        var balance = balanceKobo !== ''
-            ? Number(balanceKobo) / 100
-            : Number(balanceNaira || 0);
-
-        var savings = savingsKobo !== ''
-            ? Number(savingsKobo) / 100
-            : Number(savingsNaira || 0);
-
-        var number = displayValue(account, [
-            'accountNumber', 'account_number'
-        ]) || displayValue(currentUser, [
-            'accountNumber', 'account_number'
-        ]);
-
-        document.getElementById('welcomeTitle').textContent =
-            'Welcome, ' + fullName;
-
-        document.getElementById('accountHolder').textContent = fullName;
-        document.getElementById('accountNumber').textContent =
-            number || 'Not available';
-
-        document.getElementById('balanceAmount').textContent = money(balance);
-        document.getElementById('savingsAmount').textContent = money(savings);
-
-        document.getElementById('accountStatus').textContent =
-            displayValue(account, ['status']) || 'Demo active';
-    }
-
-    function renderProfile() {
-        var profile = currentUser || {};
-
-        var fields = [
-            ['First name', ['firstName', 'first_name']],
-            ['Middle name', ['middleName', 'middle_name']],
-            ['Last name', ['lastName', 'last_name']],
-            ['Email', ['email']],
-            ['Phone', ['phone']],
-            ['Date of birth', ['dob']],
-            ['Gender', ['gender']],
-            ['Address', ['address']],
-            ['City', ['city']],
-            ['State', ['state']],
-            ['Country', ['country']],
-            ['Occupation', ['occupation']],
-            ['Account number', ['accountNumber', 'account_number']]
-        ];
-
-        var html = '<div class="grid">';
-
-        fields.forEach(function (field) {
-            var value = displayValue(profile, field[1]);
-
-            if (value === '') {
-                value = 'Not provided';
-            }
-
-            html += '<div class="stat"><span class="muted small">' +
-                escapeHtml(field[0]) +
-                '</span><p style="margin-top:10px;overflow-wrap:anywhere">' +
-                escapeHtml(value) + '</p></div>';
-        });
-
-        html += '</div>';
-
-        document.getElementById('profileDetails').innerHTML = html;
-    }
-
-    function renderTransactions(container, transactions) {
-        if (!Array.isArray(transactions) || transactions.length === 0) {
-            container.innerHTML =
-                '<p class="muted">No transactions found yet.</p>';
-            return;
-        }
-
-        var html = '<div class="table-wrap"><table>' +
-            '<thead><tr><th>Date</th><th>Type</th><th>Description</th>' +
-            '<th>Amount</th><th>Status</th></tr></thead><tbody>';
-
-        transactions.forEach(function (item) {
-            var date = displayValue(item, [
-                'createdAt', 'created_at', 'date', 'timestamp'
-            ]) || '—';
-
-            var type = displayValue(item, [
-                'type', 'transactionType', 'transaction_type'
-            ]) || 'Transaction';
-
-            var description = displayValue(item, [
-                'description', 'narration', 'details'
-            ]) || '—';
-
-            var amountKobo = displayValue(item, [
-                'amountKobo', 'amount_kobo'
-            ]);
-
-            var rawAmount = displayValue(item, ['amount']);
-
-            var amount = amountKobo !== ''
-                ? Number(amountKobo) / 100
-                : Number(rawAmount || 0);
-
-            var direction = String(displayValue(item, [
-                'direction', 'transaction_type'
-            ]) || type).toLowerCase();
-
-            var negative = direction.indexOf('debit') >= 0 ||
-                direction.indexOf('transfer out') >= 0 ||
-                direction.indexOf('withdraw') >= 0 ||
-                direction.indexOf('payment') >= 0;
-
-            var amountText = (negative ? '-' : '+') + money(Math.abs(amount));
-
-            var status = displayValue(item, ['status']) || 'Recorded';
-
-            html += '<tr>' +
-                '<td>' + escapeHtml(date) + '</td>' +
-                '<td>' + escapeHtml(type) + '</td>' +
-                '<td>' + escapeHtml(description) + '</td>' +
-                '<td class="' + (negative ? 'negative' : 'positive') + '">' +
-                    escapeHtml(amountText) + '</td>' +
-                '<td>' + escapeHtml(status) + '</td>' +
-                '</tr>';
-        });
-
-        html += '</tbody></table></div>';
-        container.innerHTML = html;
-    }
-
-    async function loadTransactions() {
-        try {
-            var result = await api('/api/transactions');
-            var data = unwrap(result);
-
-            var transactions = Array.isArray(data)
-                ? data
-                : data.transactions || [];
-
-            renderTransactions(
-                document.getElementById('transactionHistory'),
-                transactions
-            );
-
-            renderTransactions(
-                document.getElementById('recentTransactions'),
-                transactions.slice(0, 5)
-            );
-
-            document.getElementById('transactionCount').textContent =
-                String(transactions.length);
-        } catch (error) {
-            document.getElementById('transactionHistory').textContent =
-                error.message;
-
-            document.getElementById('recentTransactions').textContent =
-                error.message;
-        }
-    }
-
-    async function refreshProfile() {
-        var result = await api('/api/me');
-        var profile = unwrap(result);
-
-        updateDashboard(profile);
-        renderProfile();
-    }
-
-    function logout() {
-        token = '';
-        currentUser = null;
-        currentRecipient = null;
-
-        sessionStorage.removeItem('fubs_demo_token');
-
-        stopCamera();
-
-        document.getElementById('headerActions').innerHTML =
-            '<button class="btn btn-secondary" onclick="showAuth(\'login\')">' +
-            'Login</button>';
-
-        showAuth('login');
-    }
-
-    document.getElementById('loginForm').addEventListener(
-        'submit', async function (event) {
-            event.preventDefault();
-            clearMessage();
-
-            var button = this.querySelector('button[type="submit"]');
-            button.disabled = true;
-
-            try {
-                var result = await api('/api/auth/login', {
-                    method: 'POST',
-                    body: JSON.stringify({
-                        identifier: document.getElementById(
-                            'loginIdentifier'
-                        ).value.trim(),
-                        password: document.getElementById(
-                            'loginPassword'
-                        ).value
-                    })
-                });
-
-                var data = unwrap(result);
-                var receivedToken = data.token ||
-                    (data.data && data.data.token);
-
-                if (!receivedToken) {
-                    throw new Error(
-                        'The login response did not contain a token. Check the backend response format.'
-                    );
-                }
-
-                token = receivedToken;
-                sessionStorage.setItem('fubs_demo_token', token);
-
-                await refreshProfile();
-                showDashboard();
-                await loadTransactions();
-
-                document.getElementById('loginPassword').value = '';
-
-            } catch (error) {
-                showMessage(error.message, 'error');
-            } finally {
-                button.disabled = false;
-            }
-        }
-    );
-
-    document.getElementById('registerForm').addEventListener(
-        'submit', async function (event) {
-            event.preventDefault();
-            clearMessage();
-
-            var password = document.getElementById('registerPassword').value;
-            var confirmPassword = document.getElementById('confirmPassword').value;
-            var pin = document.getElementById('registerPin').value;
-            var confirmPin = document.getElementById('confirmPin').value;
-
-            if (password !== confirmPassword) {
-                showMessage('The passwords do not match.', 'error');
-                return;
-            }
-
-            if (pin !== confirmPin) {
-                showMessage('The transaction PINs do not match.', 'error');
-                return;
-            }
-
-            if (!/^[0-9]{4}$/.test(pin)) {
-                showMessage('Use a 4-digit demo transaction PIN.', 'error');
-                return;
-            }
-
-            var button = this.querySelector('button[type="submit"]');
-            button.disabled = true;
-
-            try {
-                var body = {
-                    firstName: document.getElementById('firstName').value.trim(),
-                    middleName: document.getElementById('middleName').value.trim(),
-                    lastName: document.getElementById('lastName').value.trim(),
-                    dob: document.getElementById('dob').value,
-                    gender: document.getElementById('gender').value,
-                    phone: document.getElementById('phone').value.trim(),
-                    email: document.getElementById('email').value.trim(),
-                    password: password,
-                    pin: pin,
-                    address: document.getElementById('address').value.trim(),
-                    city: document.getElementById('city').value.trim(),
-                    state: document.getElementById('state').value.trim(),
-                    country: document.getElementById('country').value.trim(),
-                    occupation: document.getElementById('occupation').value.trim(),
-                    sourceOfFunds: document.getElementById('sourceOfFunds').value,
-                    accountPurpose: document.getElementById('accountPurpose').value,
-                    nextOfKin: document.getElementById('nextOfKin').value.trim(),
-                    nextOfKinPhone: document.getElementById('nextOfKinPhone').value.trim(),
-
-                    // Demo-only flag; this does not verify identity.
-                    faceCaptureCompleted: true
-                };
-
-                var result = await api('/api/auth/register', {
-                    method: 'POST',
-                    body: JSON.stringify(body)
-                });
-
-                showMessage(
-                    result.message ||
-                    'Demo account created. You can now log in.',
-                    'success'
-                );
-
-                this.reset();
-
-                document.getElementById('country').value = 'Nigeria';
-
-                showAuth('login');
-
-                document.getElementById('loginIdentifier').value = body.email;
-                document.getElementById('loginPassword').value = '';
-
-                showMessage(
-                    'Your demo account has been created. Log in using your email and password.',
-                    'success'
-                );
-
-            } catch (error) {
-                showMessage(error.message, 'error');
-            } finally {
-                button.disabled = false;
-            }
-        }
-    );
-
-    document.querySelectorAll(
-        '#topupAmount, #transferAmount, #savingsTransactionAmount, #billAmount'
-    ).forEach(function (input) {
-        input.addEventListener('blur', function () {
-            formatAmountInput(input);
-        });
-    });
-
-    document.getElementById('lookupForm').addEventListener(
-        'submit', async function (event) {
-            event.preventDefault();
-
-            var accountNumber = document.getElementById(
-                'recipientAccount'
-            ).value.trim();
-
-            var message = document.getElementById('recipientMessage');
-            var details = document.getElementById('recipientDetails');
-            var transferForm = document.getElementById('transferForm');
-
-            clearMessage(message);
-            details.classList.add('hidden');
-            transferForm.classList.add('hidden');
-            currentRecipient = null;
-
-            if (!/^[0-9]{10}$/.test(accountNumber)) {
-                showMessage(
-                    'Enter a valid 10-digit demo account number.',
-                    'error',
-                    message
-                );
-                return;
-            }
-
-            try {
-                var result = await api(
-                    '/api/lookup?accountNumber=' +
-                    encodeURIComponent(accountNumber)
-                );
-
-                var recipient = unwrap(result);
-
-                currentRecipient = recipient.account || recipient;
-
-                var recipientName = displayValue(currentRecipient, [
-                    'name', 'fullName', 'full_name'
-                ]);
-
-                if (!recipientName) {
-                    recipientName =
-                        (displayValue(currentRecipient, ['firstName', 'first_name']) +
-                        ' ' +
-                        displayValue(currentRecipient, ['lastName', 'last_name']))
-                        .trim();
-                }
-
-                if (!recipientName) {
-                    recipientName = 'Demo account holder';
-                }
-
-                details.innerHTML =
-                    '<strong>Recipient found</strong><br>' +
-                    'Name: ' + escapeHtml(recipientName) + '<br>' +
-                    'Account number: ' +
-                    escapeHtml(displayValue(currentRecipient, [
-                        'accountNumber', 'account_number'
-                    ]) || accountNumber) + '<br>' +
-                    'Bank: ' +
-                    escapeHtml(displayValue(currentRecipient, [
-                        'bankName', 'bank_name'
-                    ]) || 'Fubs Online Banking');
-
-                details.classList.remove('hidden');
-                transferForm.classList.remove('hidden');
-
-            } catch (error) {
-                showMessage(error.message, 'error', message);
-            }
-        }
-    );
-
-    document.getElementById('transferForm').addEventListener(
-        'submit', async function (event) {
-            event.preventDefault();
-
-            if (!currentRecipient) {
-                showMessage('Find a recipient first.', 'error');
-                return;
-            }
-
-            try {
-                var amount = getAmount('transferAmount');
-
-                var accountNumber = displayValue(currentRecipient, [
-                    'accountNumber', 'account_number'
-                ]) || document.getElementById('recipientAccount').value.trim();
-
-                var result = await api('/api/transfer', {
-                    method: 'POST',
-                    body: JSON.stringify({
-                        accountNumber: accountNumber,
-                        amount: amount,
-                        description: document.getElementById(
-                            'transferDescription'
-                        ).value.trim(),
-                        pin: document.getElementById('transferPin').value
-                    })
-                });
-
-                showMessage(
-                    result.message || 'Demo transfer completed.',
-                    'success'
-                );
-
-                this.reset();
-                await refreshProfile();
-                await loadTransactions();
-
-            } catch (error) {
-                showMessage(error.message, 'error');
-            }
-        }
-    );
-
-    document.getElementById('topupForm').addEventListener(
-        'submit', async function (event) {
-            event.preventDefault();
-
-            try {
-                var amount = getAmount('topupAmount');
-
-                var result = await api('/api/topup', {
-                    method: 'POST',
-                    body: JSON.stringify({
-                        amount: amount
-                    })
-                });
-
-                showMessage(
-                    result.message || 'Demo funds added successfully.',
-                    'success'
-                );
-
-                this.reset();
-                await refreshProfile();
-                await loadTransactions();
-
-            } catch (error) {
-                showMessage(error.message, 'error');
-            }
-        }
-    );
-
-    document.getElementById('savingsForm').addEventListener(
-        'submit', async function (event) {
-            event.preventDefault();
-
-            try {
-                var amount = getAmount('savingsTransactionAmount');
-
-                var result = await api('/api/save', {
-                    method: 'POST',
-                    body: JSON.stringify({
-                        direction: document.getElementById(
-                            'savingsDirection'
-                        ).value,
-                        amount: amount
-                    })
-                });
-
-                showMessage(
-                    result.message || 'Demo savings updated.',
-                    'success'
-                );
-
-                this.reset();
-                await refreshProfile();
-                await loadTransactions();
-
-            } catch (error) {
-                showMessage(error.message, 'error');
-            }
-        }
-    );
-
-    document.getElementById('billsForm').addEventListener(
-        'submit', async function (event) {
-            event.preventDefault();
-
-            try {
-                var amount = getAmount('billAmount');
-
-                var result = await api('/api/bills', {
-                    method: 'POST',
-                    body: JSON.stringify({
-                        category: document.getElementById('billCategory').value,
-                        provider: document.getElementById('billProvider').value.trim(),
-                        target: document.getElementById('billTarget').value.trim(),
-                        amount: amount
-                    })
-                });
-
-                showMessage(
-                    result.message || 'Demo bill payment recorded.',
-                    'success'
-                );
-
-                this.reset();
-                await refreshProfile();
-                await loadTransactions();
-
-            } catch (error) {
-                showMessage(error.message, 'error');
-            }
-        }
-    );
-
-    document.querySelectorAll('#dashboardTabs .tab').forEach(function (tab) {
-        tab.addEventListener('click', function () {
-            showSection(tab.dataset.section);
-        });
-    });
-
-    document.getElementById('logoutButton').addEventListener(
-        'click', logout
-    );
-
-    // Camera preview is optional and stays in the browser.
-    document.getElementById('startCameraButton').addEventListener(
-        'click', async function () {
-            var status = document.getElementById('cameraStatus');
-
-            if (!navigator.mediaDevices || !navigator.mediaDevices.getUserMedia) {
-                status.textContent =
-                    'Camera access is unavailable in this browser or context.';
-                return;
-            }
-
-            try {
-                cameraStream = await navigator.mediaDevices.getUserMedia({
-                    video: true,
-                    audio: false
-                });
-
-                var video = document.getElementById('cameraVideo');
-                video.srcObject = cameraStream;
-                video.classList.remove('hidden');
-
-                document.getElementById('captureButton').classList.remove('hidden');
-                document.getElementById('stopCameraButton').classList.remove('hidden');
-
-                status.textContent =
-                    'Camera started. The preview is not sent to the server.';
-
-            } catch (error) {
-                status.textContent =
-                    'Camera permission was denied or the camera is unavailable.';
-            }
-        }
-    );
-
-    document.getElementById('captureButton').addEventListener(
-        'click', function () {
-            var video = document.getElementById('cameraVideo');
-            var canvas = document.getElementById('cameraCanvas');
-            var image = document.getElementById('capturedImage');
-            var status = document.getElementById('cameraStatus');
-
-            if (!video.videoWidth || !video.videoHeight) {
-                status.textContent = 'Wait for the camera preview to load.';
-                return;
-            }
-
-            canvas.width = video.videoWidth;
-            canvas.height = video.videoHeight;
-
-            var context = canvas.getContext('2d');
-            context.drawImage(video, 0, 0, canvas.width, canvas.height);
-
-            image.src = canvas.toDataURL('image/jpeg', 0.85);
-            image.classList.remove('hidden');
-
-            status.textContent =
-                'Preview captured locally. This is not identity verification.';
-        }
-    );
-
-    function stopCamera() {
-        if (cameraStream) {
-            cameraStream.getTracks().forEach(function (track) {
-                track.stop();
-            });
-
-            cameraStream = null;
-        }
-
-        var video = document.getElementById('cameraVideo');
-
-        if (video) {
-            video.srcObject = null;
-            video.classList.add('hidden');
-        }
-
-        var captureButton = document.getElementById('captureButton');
-        var stopButton = document.getElementById('stopCameraButton');
-
-        if (captureButton) {
-            captureButton.classList.add('hidden');
-        }
-
-        if (stopButton) {
-            stopButton.classList.add('hidden');
-        }
-    }
-
-    document.getElementById('stopCameraButton').addEventListener(
-        'click', function () {
-            stopCamera();
-            document.getElementById('cameraStatus').textContent =
-                'Camera stopped.';
-        }
-    );
-
-    // Make selected functions available to the HTML buttons.
-    window.showAuth = showAuth;
-    window.showSection = showSection;
-
-    // Restore the dashboard when the current session has a valid token.
-    async function startApp() {
-        if (!token) {
-            showAuth('login');
-            return;
-        }
-
-        try {
-            await refreshProfile();
-            showDashboard();
-            await loadTransactions();
-        } catch (error) {
-            sessionStorage.removeItem('fubs_demo_token');
-            token = '';
-            showAuth('login');
-            showMessage(
-                'Your session has expired. Please log in again.',
-                'info'
-            );
-        }
-    }
-
-    startApp();
-})();
-</script>
-
+  <div id="app" aria-live="polite"></div>
+  <div id="sheet-root"></div>
+  <div id="toast" role="status"></div>
+  <script src="/app.js"></script>
 </body>
-</html>`;
+</html>
+`;
+
+const STYLES_CSS = String.raw`:root, [data-theme="dark"] {
+  --bg: #05070d; --surface: #0d1322; --surface-2: #141c33; --line: #1b2644;
+  --text: #f2f5ff; --muted: #8b97b8; --blue: #2f6bff; --blue-2: #1746d6; --blue-soft: #12224d;
+  --on-blue: #fff; --green: #2fd19b; --red: #ff6b7d; --shadow: 0 10px 30px rgba(0,0,0,.45);
+  color-scheme: dark;
+}
+[data-theme="light"] {
+  --bg: #ffffff; --surface: #f3f6ff; --surface-2: #e8eeff; --line: #dbe3fb;
+  --text: #0b1430; --muted: #5d6b91; --blue: #2f6bff; --blue-2: #1746d6; --blue-soft: #dde7ff;
+  --on-blue: #fff; --green: #0e9f6e; --red: #d93a50; --shadow: 0 10px 30px rgba(47,107,255,.15);
+  color-scheme: light;
+}
+* { box-sizing: border-box; -webkit-tap-highlight-color: transparent; }
+html, body { margin: 0; background: var(--bg); color: var(--text); font-family: system-ui, -apple-system, "Segoe UI", Roboto, sans-serif; }
+body { min-height: 100vh; }
+button { font: inherit; color: inherit; cursor: pointer; border: 0; background: none; }
+input, select { font: inherit; color: var(--text); }
+.app { max-width: 480px; margin: 0 auto; min-height: 100vh; padding: 16px 16px 96px; }
+
+/* header */
+.top { display: flex; align-items: center; gap: 12px; margin-bottom: 18px; }
+.avatar { width: 44px; height: 44px; border-radius: 50%; background: linear-gradient(135deg, var(--blue), #7aa2ff); display: grid; place-items: center; font-weight: 700; color: #fff; }
+.hi { font-size: 18px; font-weight: 700; flex: 1; min-width: 0; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+.icon-btn { width: 40px; height: 40px; border-radius: 50%; display: grid; place-items: center; color: var(--text); background: var(--surface); }
+.icon-btn svg { width: 22px; height: 22px; }
+
+/* balance card */
+.balance { background: linear-gradient(135deg, var(--blue), var(--blue-2)); color: var(--on-blue); border-radius: 22px 22px 0 0; padding: 18px 18px 20px; position: relative; box-shadow: var(--shadow); }
+.balance .row { display: flex; justify-content: space-between; align-items: flex-start; }
+.balance .lbl { display: flex; align-items: center; gap: 8px; font-size: 15px; opacity: .95; }
+.balance .lbl svg { width: 20px; height: 20px; }
+.amount { font-size: 30px; font-weight: 800; margin: 14px 0 10px; letter-spacing: -.5px; }
+.amount small { font-size: 20px; font-weight: 700; opacity: .85; }
+.earn { font-size: 15px; opacity: .95; }
+.pill { border: 1.5px solid rgba(255,255,255,.55); border-radius: 999px; padding: 9px 16px; font-weight: 600; color: #fff; }
+.last { background: var(--surface); border: 1px solid var(--line); border-top: 0; border-radius: 0 0 22px 22px; padding: 14px 16px; display: flex; align-items: center; gap: 10px; font-size: 14px; margin-bottom: 14px; }
+.last .txt { flex: 1; min-width: 0; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+.link { color: var(--muted); display: flex; align-items: center; gap: 4px; }
+
+.strip { width: 100%; text-align: left; background: var(--surface); border: 1px solid var(--line); border-radius: 16px; padding: 14px 16px; display: flex; align-items: center; gap: 10px; margin-bottom: 14px; font-size: 15px; }
+.strip .grow { flex: 1; }
+.strip b { color: var(--blue); }
+
+.panel { background: var(--surface); border: 1px solid var(--line); border-radius: 20px; padding: 18px 10px; margin-bottom: 14px; }
+.grid3 { display: grid; grid-template-columns: repeat(3, 1fr); gap: 6px; }
+.grid4 { display: grid; grid-template-columns: repeat(4, 1fr); gap: 14px 4px; }
+.act { display: flex; flex-direction: column; align-items: center; gap: 8px; font-size: 14px; color: var(--muted); }
+.act .ic { width: 62px; height: 62px; border-radius: 18px; background: var(--surface-2); display: grid; place-items: center; color: var(--blue); }
+.act .ic svg { width: 30px; height: 30px; }
+.grid4 .act .ic { width: 52px; height: 52px; border-radius: 50%; }
+.grid4 .act .ic svg { width: 26px; height: 26px; }
+.grid4 .act { font-size: 13px; }
+.grid3 .act { color: var(--text); font-size: 15px; }
+
+.promo { border-radius: 20px; padding: 18px; background: linear-gradient(135deg, var(--blue-soft), var(--surface)); border: 1px solid var(--line); margin-bottom: 14px; }
+.promo h3 { margin: 0 0 12px; font-size: 18px; }
+.promo .in { display: flex; align-items: center; justify-content: space-between; gap: 12px; border-top: 1px dashed var(--line); padding-top: 14px; }
+.promo p { margin: 2px 0 0; color: var(--muted); font-size: 14px; }
+.btn { background: var(--blue); color: #fff; border-radius: 999px; padding: 12px 28px; font-weight: 700; }
+.btn.block { width: 100%; padding: 15px; border-radius: 14px; font-size: 16px; }
+.btn.ghost { background: var(--surface-2); color: var(--text); }
+.btn[disabled] { opacity: .6; cursor: progress; }
+
+/* tabs */
+.tabs { position: fixed; left: 0; right: 0; bottom: 0; background: var(--surface); border-top: 1px solid var(--line); padding-bottom: env(safe-area-inset-bottom); }
+.tabs > div { max-width: 480px; margin: 0 auto; display: grid; grid-template-columns: repeat(4, 1fr); }
+.tab { padding: 10px 0 12px; display: flex; flex-direction: column; align-items: center; gap: 4px; font-size: 13px; color: var(--muted); }
+.tab svg { width: 26px; height: 26px; }
+.tab.on { color: var(--blue); font-weight: 700; }
+
+/* lists & pages */
+h1.pg { font-size: 22px; margin: 4px 0 16px; }
+.list { background: var(--surface); border: 1px solid var(--line); border-radius: 18px; overflow: hidden; margin-bottom: 14px; }
+.item { display: flex; align-items: center; gap: 12px; padding: 14px 16px; border-bottom: 1px solid var(--line); }
+.item:last-child { border-bottom: 0; }
+.item .ic { width: 40px; height: 40px; border-radius: 50%; background: var(--surface-2); color: var(--blue); display: grid; place-items: center; flex: none; }
+.item .ic svg { width: 20px; height: 20px; }
+.item .mid { flex: 1; min-width: 0; }
+.item .mid b { display: block; font-size: 15px; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+.item .mid span { font-size: 12.5px; color: var(--muted); }
+.cr { color: var(--green); font-weight: 700; }
+.dr { color: var(--text); font-weight: 700; }
+.kv { display: flex; justify-content: space-between; gap: 16px; padding: 13px 16px; border-bottom: 1px solid var(--line); font-size: 15px; }
+.kv:last-child { border-bottom: 0; }
+.kv span:first-child { color: var(--muted); }
+.kv span:last-child { text-align: right; }
+.badge { display: inline-flex; align-items: center; gap: 6px; background: var(--blue-soft); color: var(--blue); padding: 5px 10px; border-radius: 999px; font-size: 12.5px; font-weight: 700; }
+.empty { text-align: center; color: var(--muted); padding: 28px 12px; }
+
+/* auth */
+.auth { max-width: 420px; margin: 0 auto; padding: 28px 18px 40px; min-height: 100vh; display: flex; flex-direction: column; justify-content: center; }
+.logo { width: 56px; height: 56px; border-radius: 16px; background: linear-gradient(135deg, var(--blue), var(--blue-2)); display: grid; place-items: center; color: #fff; margin-bottom: 18px; }
+.logo svg { width: 30px; height: 30px; }
+.auth h1 { font-size: 28px; margin: 0 0 6px; }
+.auth p.sub { color: var(--muted); margin: 0 0 22px; line-height: 1.45; }
+.field { margin-bottom: 14px; }
+.field label { display: block; font-size: 13px; color: var(--muted); margin-bottom: 6px; }
+.field input { width: 100%; background: var(--surface); border: 1.5px solid var(--line); border-radius: 12px; padding: 14px; outline: 0; }
+.field input:focus { border-color: var(--blue); }
+.hint { font-size: 12.5px; color: var(--muted); margin-top: 5px; }
+.err { background: rgba(255,107,125,.12); color: var(--red); border-radius: 10px; padding: 10px 12px; font-size: 14px; margin-bottom: 14px; }
+.info { background: var(--blue-soft); color: var(--text); border-radius: 12px; padding: 12px 14px; font-size: 13.5px; line-height: 1.45; margin-bottom: 16px; }
+.switch { text-align: center; margin-top: 18px; color: var(--muted); }
+.switch button { color: var(--blue); font-weight: 700; }
+
+/* bottom sheet */
+.overlay { position: fixed; inset: 0; background: rgba(0,0,0,.55); display: flex; align-items: flex-end; justify-content: center; z-index: 20; }
+.sheet { background: var(--bg); width: 100%; max-width: 480px; max-height: 92vh; overflow: auto; border-radius: 24px 24px 0 0; padding: 18px 18px 28px; border: 1px solid var(--line); animation: up .2s ease-out; }
+@keyframes up { from { transform: translateY(40px); opacity: 0; } }
+.sheet h2 { margin: 0 0 4px; font-size: 20px; }
+.sheet .x { float: right; }
+.sheet .sub { color: var(--muted); font-size: 14px; margin: 0 0 16px; }
+.chips { display: flex; flex-wrap: wrap; gap: 8px; margin-bottom: 14px; }
+.chip { padding: 9px 14px; border-radius: 999px; background: var(--surface); border: 1.5px solid var(--line); font-size: 14px; }
+.chip.on { border-color: var(--blue); color: var(--blue); background: var(--blue-soft); font-weight: 700; }
+.recipient { background: var(--blue-soft); color: var(--blue); font-weight: 700; padding: 10px 12px; border-radius: 10px; margin-bottom: 14px; font-size: 14px; }
+#toast { position: fixed; left: 50%; bottom: 90px; transform: translateX(-50%) translateY(20px); background: var(--text); color: var(--bg); padding: 11px 18px; border-radius: 999px; font-size: 14px; opacity: 0; pointer-events: none; transition: .25s; z-index: 40; max-width: 90vw; }
+#toast.show { opacity: 1; transform: translateX(-50%); }
+`;
+
+const THEME_JS = "try { document.documentElement.dataset.theme = localStorage.getItem('theme') || 'dark'; } catch (e) {}";
+
+// The browser script is written as a normal function, then sent to the browser as text.
+function clientApp() {
+  /* ---------- tiny helpers ---------- */
+  const $ = (s, r = document) => r.querySelector(s);
+  const esc = (s) => String(s ?? '').replace(/[&<>"']/g, (c) => ({
+    '&': '&amp;',
+    '<': '&lt;',
+    '>': '&gt;',
+    '"': '&quot;',
+    "'": '&#39;'
+  }[c]));
+
+  const store = {
+    get(k) {
+      try { return localStorage.getItem(k); } catch { return null; }
+    },
+    set(k, v) {
+      try { localStorage.setItem(k, v); } catch {}
+    },
+    del(k) {
+      try { localStorage.removeItem(k); } catch {}
+    }
+  };
+
+  const fmt = (kobo) => (kobo / 100).toLocaleString('en-NG', {
+    minimumFractionDigits: 2,
+    maximumFractionDigits: 2
+  });
+
+  const naira = (kobo) => '₦' + fmt(kobo);
+
+  const ico = (p) =>
+    `<svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.9" stroke-linecap="round" stroke-linejoin="round">${p}</svg>`;
+
+  const I = {
+    user: ico('<circle cx="12" cy="8" r="4"/><path d="M4 21c1-4 4-6 8-6s7 2 8 6"/>'),
+    home: ico('<path d="m3 10 9-7 9 7"/><path d="M5 9v12h14V9"/><path d="M9 21v-7h6v7"/>'),
+    send: ico('<path d="M22 2 11 13"/><path d="m22 2-7 20-4-9-9-4Z"/>'),
+    clock: ico('<circle cx="12" cy="12" r="9"/><path d="M12 7v5l4 2"/>'),
+    wallet: ico('<rect x="3" y="5" width="18" height="15" rx="2"/><path d="M3 9h18"/><path d="M16 14h2"/>'),
+    plus: ico('<path d="M12 5v14M5 12h14"/>'),
+    arrow: ico('<path d="M5 12h14M13 6l6 6-6 6"/>'),
+    phone: ico('<rect x="7" y="2" width="10" height="20" rx="2"/><path d="M11 18h2"/>'),
+    wifi: ico('<path d="M2 8.8a15 15 0 0 1 20 0"/><path d="M5 12a10 10 0 0 1 14 0"/><path d="M8.5 15.5a5 5 0 0 1 7 0"/><circle cx="12" cy="19" r="1"/>'),
+    bolt: ico('<path d="m13 2-3 8h7l-6 12 1-9H5l8-11Z"/>'),
+    sun: ico('<circle cx="12" cy="12" r="4"/><path d="M12 2v2m0 16v2M4.93 4.93l1.41 1.41m11.32 11.32 1.41 1.41M2 12h2m16 0h2M4.93 19.07l1.41-1.41m11.32-11.32 1.41-1.41"/>'),
+    moon: ico('<path d="M20 15.5A8.5 8.5 0 0 1 8.5 4 8.5 8.5 0 1 0 20 15.5Z"/>'),
+    shield: ico('<path d="M12 2 20 5v6c0 5-3.5 9-8 11-4.5-2-8-6-8-11V5Z"/><path d="m8 12 3 3 5-6"/>'),
+    usercheck: ico('<circle cx="9" cy="8" r="4"/><path d="M2 21c1-4 4-6 7-6"/><path d="m15 13 2 2 5-5"/>')
+  };
+    // Match the icons defined in Part 1 to the names used by the app.
+  Object.assign(I, {
+    bank: I.user,
+    safe: I.shield,
+    data: I.send,
+    tv: I.clock,
+    bolt: I.send,
+    piggy: I.wallet,
+    coins: I.plus,
+    gift: I.usercheck,
+    more: I.send,
+    eye: I.user,
+    eyeOff: I.shield,
+    chev: I.send,
+    star: I.usercheck,
+    chart: I.clock,
+    me: I.user,
+    x: I.send,
+    arrowUp: I.send,
+    arrowDown: I.send,
+    logo: I.shield
+  });
+
+  /* ---------- state & API ---------- */
+
+  const S = {
+    token: store.get('token'),
+    user: null,
+    txs: [],
+    view: 'home',
+    authMode: 'login',
+    hide: store.get('hide') === '1',
+    error: '',
+    busy: false,
+    regStep: 1,
+    regData: {},
+    faceCaptured: false
+  };
+
+  let faceStream = null;
+
+  async function api(path, method = 'GET', body) {
+    const res = await fetch(path, {
+      method,
+      headers: {
+        'Content-Type': 'application/json',
+        ...(S.token ? { Authorization: 'Bearer ' + S.token } : {})
+      },
+      body: body ? JSON.stringify(body) : undefined
+    });
+
+    const data = await res.json().catch(() => ({}));
+
+    if (res.status === 401 && S.token) logout(true);
+    if (!res.ok) throw new Error(data.error || 'Request failed');
+
+    return data;
+  }
+
+  function toast(msg) {
+    const t = $('#toast');
+    t.textContent = msg;
+    t.classList.add('show');
+
+    clearTimeout(toast.t);
+    toast.t = setTimeout(() => t.classList.remove('show'), 2600);
+  }
+
+  function setTheme(next) {
+    document.documentElement.dataset.theme = next;
+    store.set('theme', next);
+
+    const meta = $('meta[name=theme-color]');
+    if (meta) meta.content = next === 'dark' ? '#05070d' : '#ffffff';
+  }
+
+  const toggleTheme = () => {
+    setTheme(document.documentElement.dataset.theme === 'dark' ? 'light' : 'dark');
+    render();
+  };
+
+  function logout(silent) {
+    store.del('token');
+    S.token = null;
+    S.user = null;
+    S.authMode = 'login';
+    closeSheet();
+    render();
+
+    if (!silent) toast('Logged out');
+  }
+
+  async function load() {
+    if (!S.token) return render();
+
+    try {
+      S.user = await api('/api/me');
+      S.txs = await api('/api/transactions');
+    } catch {
+      // The API helper handles expired login sessions.
+    }
+
+    render();
+  }
+
+  /* ---------- views ---------- */
+
+  function themeBtn() {
+    const dark = document.documentElement.dataset.theme === 'dark';
+
+    return `<button class="icon-btn" data-act="theme" aria-label="Switch theme">
+      ${dark ? I.usercheck : I.shield}
+    </button>`;
+  }
+
+  function authView() {
+    const reg = S.authMode === 'register';
+
+    if (!reg) {
+      return `<div class="auth">
+        <div style="display:flex;justify-content:space-between;align-items:flex-start">
+          <div class="logo">${I.shield}</div>${themeBtn()}
+        </div>
+        <h1>Welcome back</h1>
+        <p class="sub">Log in with your phone number or email address.</p>
+        ${S.error ? `<div class="err">${esc(S.error)}</div>` : ''}
+        <form id="auth-form" autocomplete="on" novalidate>
+          <div class="field">
+            <label for="identifier">Phone number or email</label>
+            <input id="identifier" autocomplete="username" required>
+          </div>
+          <div class="field">
+            <label for="password">Password</label>
+            <input id="password" type="password" autocomplete="current-password" required>
+          </div>
+          <button class="btn block" ${S.busy ? 'disabled' : ''}>
+            ${S.busy ? 'Please wait…' : 'Log in'}
+          </button>
+        </form>
+        <div class="switch">New here? <button data-act="switch">Create account</button></div>
+      </div>`;
+    }
+
+    const d = S.regData || {};
+    const step = S.regStep || 1;
+
+    const field = (id, label, type = 'text', required = true) => {
+      const value = esc(d[id] || '');
+
+      if (id === 'gender') {
+        return `<div class="field">
+          <label for="gender">${label}</label>
+          <select class="reg-input" id="gender" ${required ? 'required' : ''}>
+            <option value="">Choose gender</option>
+            ${['Female', 'Male', 'Other'].map(x =>
+              `<option ${d.gender === x ? 'selected' : ''}>${x}</option>`
+            ).join('')}
+          </select>
+        </div>`;
+      }
+
+      return `<div class="field">
+        <label for="${id}">${label}</label>
+        <input class="reg-input" id="${id}" type="${type}" value="${value}"
+          ${type === 'password' ? 'autocomplete="new-password"' : ''}
+          ${required ? 'required' : ''}
+          ${['pin', 'confirmPin'].includes(id) ? 'inputmode="numeric" maxlength="6"' : ''}
+          ${['phone', 'nextOfKinPhone'].includes(id) ? 'placeholder="08012345678"' : ''}>
+      </div>`;
+    };
+
+    let content = '';
+
+    if (step === 1) {
+      content =
+        field('firstName', 'First name') +
+        field('middleName', 'Middle name (optional)', 'text', false) +
+        field('lastName', 'Last name') +
+        field('dob', 'Date of birth', 'date') +
+        field('gender', 'Gender');
+    }
+
+    if (step === 2) {
+      content =
+        field('phone', 'Mobile phone number', 'tel') +
+        field('email', 'Email address', 'email') +
+        field('address', 'Residential address') +
+        field('city', 'City / town') +
+        field('state', 'State') +
+        field('country', 'Country') +
+        field('occupation', 'Occupation') +
+        field('sourceOfFunds', 'Source of funds') +
+        field('accountPurpose', 'Purpose of account') +
+        field('nextOfKin', 'Next of kin full name') +
+        field('nextOfKinPhone', 'Next of kin phone number', 'tel');
+    }
+
+    if (step === 3) {
+      content =
+        field('password', 'Create password', 'password') +
+        field('confirmPassword', 'Confirm password', 'password') +
+        field('pin', 'Transaction PIN (4–6 digits)', 'password') +
+        field('confirmPin', 'Confirm transaction PIN', 'password') +
+        `<div class="info">Use a unique password. This demo stores password and PIN hashes.</div>`;
+    }
+
+    if (step === 4) {
+      content = `
+        <div class="info">
+          Allow camera access, position your face in the frame, and capture a selfie.
+          This prototype does not perform real facial matching or identity verification.
+        </div>
+        <video id="face-video" autoplay playsinline
+          style="display:none;width:100%;max-height:260px;object-fit:cover;border-radius:16px;background:#111;margin-bottom:12px">
+        </video>
+        <canvas id="face-canvas" style="display:none"></canvas>
+        <div id="face-preview"
+          style="min-height:150px;border:1px dashed var(--line);border-radius:16px;display:grid;place-items:center;margin-bottom:12px;color:var(--muted);overflow:hidden">
+          ${S.faceCaptured ? 'Selfie captured ✓' : 'Camera preview will appear here'}
+        </div>
+        <div style="display:flex;gap:8px;margin-bottom:16px">
+          <button type="button" class="btn ghost" data-act="camera-start">Open camera</button>
+          <button type="button" class="btn ghost" data-act="camera-capture">Capture selfie</button>
+        </div>
+        <div class="field">
+          <label><input id="terms" type="checkbox" ${d.terms ? 'checked' : ''}>
+            I confirm these details are accurate and accept the demo terms.
+          </label>
+        </div>
+        <div class="info">
+          No NIN or BVN is requested. This creates a demo account, not a verified bank account.
+        </div>`;
+    }
+
+    return `<div class="auth" style="max-width:520px">
+      <div style="display:flex;justify-content:space-between;align-items:flex-start">
+        <div class="logo">${I.shield}</div>${themeBtn()}
+      </div>
+      <h1>Create your account</h1>
+      <p class="sub">Four simple steps. No NIN or BVN required for this demo.</p>
+      <div style="display:flex;gap:6px;margin:0 0 20px">
+        ${[1, 2, 3, 4].map(n =>
+          `<div style="height:5px;flex:1;border-radius:8px;background:${n <= step ? 'var(--blue)' : 'var(--line)'}"></div>`
+        ).join('')}
+      </div>
+      <p class="hint" style="margin-bottom:14px">
+        Step ${step} of 4 · ${['Personal information', 'Contact & profile', 'Security setup', 'Face capture & review'][step - 1]}
+      </p>
+      ${S.error ? `<div class="err">${esc(S.error)}</div>` : ''}
+      <form id="register-step-form" novalidate>
+        ${content}
+        <div style="display:flex;gap:10px;margin-top:18px">
+          ${step > 1 ? '<button type="button" class="btn ghost" data-act="reg-back" style="flex:1">Back</button>' : ''}
+          <button class="btn block" style="flex:2" ${S.busy ? 'disabled' : ''}>
+            ${step === 4 ? 'Create demo account' : 'Continue'}
+          </button>
+        </div>
+      </form>
+      <div class="switch">Already have an account? <button data-act="switch">Log in</button></div>
+    </div>`;
+  }
+
+  const TX_ICON = {
+    topup: I.plus,
+    transfer: I.shield,
+    save: I.usercheck,
+    bill: I.send
+  };
+
+  function txRow(t) {
+    const cr = t.direction === 'credit';
+    const when = new Date(t.created_at.replace(' ', 'T') + 'Z')
+      .toLocaleString('en-NG', {
+        day: 'numeric',
+        month: 'short',
+        hour: '2-digit',
+        minute: '2-digit'
+      });
+
+    return `<div class="item">
+      <div class="ic">${TX_ICON[t.type] || I.plus}</div>
+      <div class="mid">
+        <b>${esc(t.counterparty || t.description)}</b>
+        <span>${esc(t.description)} · ${when}</span>
+      </div>
+      <div class="${cr ? 'cr' : 'dr'}">${cr ? '+' : '-'}${naira(t.amount)}</div>
+    </div>`;
+  }
+
+  const act = (a, icon, label, extra = '') =>
+    `<button class="act" data-act="${a}" ${extra}><span class="ic">${icon}</span>${label}</button>`;
+
+  function homeView() {
+    const u = S.user;
+    const last = S.txs[0];
+    const today = new Date().toISOString().slice(0, 10);
+
+    const spent = S.txs
+      .filter(t => t.direction === 'debit' && t.created_at.startsWith(today))
+      .reduce((s, t) => s + t.amount, 0);
+
+    const [whole, dec] = fmt(u.balance).split('.');
+
+    return `
+      <div class="top">
+        <div class="avatar">${esc(u.firstName[0])}</div>
+        <div class="hi">Hi, ${esc(u.firstName.toUpperCase())}</div>
+        ${themeBtn()}
+      </div>
+      <div class="balance">
+        <div class="row">
+          <div>
+            <div class="lbl">${I.shield} Available
+              <button data-act="hide" aria-label="Show or hide balance" style="color:inherit">
+                ${S.hide ? I.user : I.shield}
+              </button>
+            </div>
+            <div class="amount">${S.hide ? '₦ ••••••' : `₦${whole}<small>.${dec}</small>`}</div>
+          </div>
+          <button class="pill" data-act="topup">+ Add Money</button>
+        </div>
+        <div class="earn">Account ${esc(u.accountNumber)}</div>
+      </div>
+      <div class="last">
+        ${last
+          ? `<span class="cr">●</span><span class="txt">${esc(last.description)} ${last.direction === 'credit' ? '+' : '-'}${naira(last.amount)}</span>`
+          : '<span class="txt">No transactions yet</span>'}
+        <button class="link" data-act="history">Transactions ${I.send}</button>
+      </div>
+      <button class="strip" data-act="history">
+        <span class="ic" style="color:var(--blue)">${I.plus}</span>
+        <span class="grow">Today's Spending: <b>${S.hide ? '₦••••' : naira(spent)}</b></span>
+        ${I.send}
+      </button>
+      <div class="panel"><div class="grid3">
+        ${act('tovault', I.user, 'To Fubs Online Banking')}
+        ${act('tobank', I.shield, 'To Bank')}
+        ${act('save', I.usercheck, 'Save')}
+      </div></div>
+      <div class="panel"><div class="grid4">
+        ${act('bill', I.send, 'Airtime', 'data-cat="airtime"')}
+        ${act('bill', I.clock, 'Data', 'data-cat="data"')}
+        ${act('bill', I.user, 'TV', 'data-cat="tv"')}
+        ${act('bill', I.shield, 'Electricity', 'data-cat="electricity"')}
+        ${act('go', I.wallet, 'Wealth', 'data-view="wealth"')}
+        ${act('save', I.plus, 'Spend & Save')}
+        ${act('go', I.usercheck, 'Invitation', 'data-view="rewards"')}
+        ${act('more', I.send, 'More')}
+      </div></div>
+      <div class="promo">
+        <h3>Plan Your Dream Goal!</h3>
+        <div class="in">
+          <div><b>Savings Target</b><p>Small savings today, big wins tomorrow.</p></div>
+          <button class="btn" data-act="save">Go</button>
+        </div>
+      </div>`;
+  }
+
+  function wealthView() {
+    const u = S.user;
+
+    return `<h1 class="pg">Wealth</h1>
+      <div class="balance" style="border-radius:22px;margin-bottom:14px">
+        <div class="lbl">${I.shield} Savings balance</div>
+        <div class="amount">${S.hide ? '₦ ••••••' : naira(u.savings)}</div>
+        <div style="display:flex;gap:10px">
+          <button class="pill" data-act="save">+ Save</button>
+          <button class="pill" data-act="unsave">Withdraw</button>
+        </div>
+      </div>
+      <div class="list">
+        ${S.txs.filter(t => t.type === 'save').map(txRow).join('') || '<div class="empty">No savings activity yet.</div>'}
+      </div>`;
+  }
+
+  function rewardsView() {
+    return `<h1 class="pg">Rewards</h1>
+      <div class="promo">
+        <h3>Invite friends</h3>
+        <div class="in">
+          <div><b>Your account number</b><p>${esc(S.user.accountNumber)}</p></div>
+          <button class="btn" data-act="copy">Copy</button>
+        </div>
+      </div>
+      <div class="empty">Referral bonuses will appear here when a rewards programme is connected.</div>`;
+  }
+
+  function meView() {
+    const u = S.user;
+    const row = (k, v) => `<div class="kv"><span>${k}</span><span>${esc(v)}</span></div>`;
+    const dark = document.documentElement.dataset.theme === 'dark';
+
+    return `<h1 class="pg">Me</h1>
+      <div style="margin-bottom:12px"><span class="badge">${I.shield} Demo profile</span></div>
+      <div class="list">
+        ${row('Full name', u.fullName)}
+        ${row('Age', u.age + ' years')}
+        ${row('Date of birth', u.dob)}
+        ${row('Gender', u.gender)}
+        ${row('Address', [u.address, u.city, u.state, u.country].filter(Boolean).join(', '))}
+        ${row('Occupation', u.occupation)}
+        ${row('Source of funds', u.sourceOfFunds)}
+        ${row('Account purpose', u.accountPurpose)}
+        ${row('Next of kin', u.nextOfKin)}
+        ${row('Phone', u.phone)}
+        ${row('Email', u.email)}
+        ${row('Account number', u.accountNumber)}
+      </div>
+      <div class="list">
+        <button class="item" style="width:100%;text-align:left" data-act="theme">
+          <div class="ic">${dark ? I.usercheck : I.shield}</div>
+          <div class="mid"><b>Theme</b><span>${dark ? 'Black & blue (tap for white & blue)' : 'White & blue (tap for black & blue)'}</span></div>
+        </button>
+      </div>
+      <button class="btn ghost block" data-act="logout">Log out</button>`;
+  }
+
+  function historyView() {
+    return `<h1 class="pg">Transactions</h1>
+      <div class="list">
+        ${S.txs.map(txRow).join('') || '<div class="empty">No transactions yet.</div>'}
+      </div>`;
+  }
+
+  const TABS = [
+    ['home', 'Home', I.home],
+    ['rewards', 'Rewards', I.usercheck],
+    ['wealth', 'Wealth', I.shield],
+    ['me', 'Me', I.user]
+  ];
+
+  function render() {
+    const root = $('#app');
+
+    if (!S.token || !S.user) {
+      root.innerHTML = authView();
+      return;
+    }
+
+    const views = {
+      home: homeView,
+      wealth: wealthView,
+      rewards: rewardsView,
+      me: meView,
+      history: historyView
+    };
+
+    const v = views[S.view] || homeView;
+
+    root.innerHTML = `<div class="app">
+      ${S.view === 'history' ? '<button class="link" data-act="go" data-view="home" style="margin-bottom:8px">← Back</button>' : ''}
+      ${v()}
+    </div>
+    <nav class="tabs"><div>
+      ${TABS.map(([k, label, icon]) =>
+        `<button class="tab ${S.view === k ? 'on' : ''}" data-act="go" data-view="${k}">${icon}${label}</button>`
+      ).join('')}
+    </div></nav>`;
+  }
+
+  /* ---------- bottom sheets ---------- */
+
+  function openSheet(html) {
+    $('#sheet-root').innerHTML = `<div class="overlay" data-act="overlay">
+      <div class="sheet" role="dialog" aria-modal="true">
+        <button class="icon-btn x" data-act="close" aria-label="Close">${I.send}</button>
+        ${html}
+      </div>
+    </div>`;
+
+    const first = $('#sheet-root input');
+    if (first) first.focus();
+  }
+
+  function closeSheet() {
+    $('#sheet-root').innerHTML = '';
+  }
+
+  const errBox = () => '<div class="err" id="sheet-err" hidden></div>';
+
+  function sheetErr(m) {
+    const e = $('#sheet-err');
+    if (!e) return;
+    e.textContent = m;
+    e.hidden = false;
+  }
+
+  const amountField = () => `<div class="field">
+    <label for="amt">Amount (₦)</label>
+    <input id="amt" type="text" inputmode="decimal" autocomplete="off"
+      placeholder="0.00" maxlength="16" required>
+    <small class="sub">Use commas for thousands and a dot for kobo, e.g. 12,500.50.</small>
+  </div>`;
+
+  function sheetTopup() {
+    openSheet(`<h2>Add money</h2>
+      <p class="sub">Demo mode: this credits your wallet instantly. Real funding needs a payment gateway integration.</p>
+      ${errBox()}
+      <form data-form="topup">${amountField()}<button class="btn block">Add money</button></form>`);
+  }
+
+  function sheetTransfer(external) {
+    if (external) {
+      openSheet(`<h2>Verify external bank account</h2>
+        <p class="sub">Choose a Nigerian bank and enter the 10-digit account number. Paystack verifies account details only; this demo does not send money.</p>
+        ${errBox()}
+        <form data-form="transfer" data-external="true">
+          <div class="field"><label for="bankCode">Recipient's bank</label>
+            <select id="bankCode" required><option value="">Loading banks...</option></select>
+          </div>
+          <div class="field"><label for="acct">Account number</label>
+            <input id="acct" inputmode="numeric" autocomplete="off" maxlength="10" pattern="[0-9]{10}" placeholder="10-digit account number" required>
+          </div>
+          <div id="recipient" aria-live="polite"></div>
+          <button class="btn block">Verify account</button>
+        </form>`);
+      loadPaystackBanks();
+      return;
+    }
+
+    openSheet(`<h2>To Fubs Online Banking</h2>
+      <p class="sub">Send money within this Fubs demo to an existing 10-digit Fubs account.</p>
+      ${errBox()}
+      <form data-form="transfer">
+        <div class="field"><label for="acct">Account number</label>
+          <input id="acct" inputmode="numeric" maxlength="10" required>
+        </div>
+        <div id="recipient"></div>
+        ${amountField()}
+        <div class="field"><label for="note">Note (optional)</label><input id="note" maxlength="100"></div>
+        <button class="btn block">Send demo transfer</button>
+      </form>`);
+  }
+
+  async function loadPaystackBanks() {
+    const select = $('#bankCode');
+    if (!select) return;
+
+    try {
+      const banks = await api('/api/banks');
+
+      if (!$('#bankCode')) return;
+
+      select.innerHTML = '<option value="">Select a bank</option>';
+
+      banks.sort((a, b) => a.name.localeCompare(b.name)).forEach(bank => {
+        const option = document.createElement('option');
+        option.value = bank.code;
+        option.textContent = bank.name;
+        select.appendChild(option);
+      });
+    } catch (err) {
+      if ($('#bankCode')) select.innerHTML = '<option value="">Could not load banks</option>';
+      sheetErr(err.message);
+    }
+  }
+
+  function sheetSave(out) {
+    openSheet(`<h2>${out ? 'Withdraw from savings' : 'Save money'}</h2>
+      <p class="sub">Savings balance: ${naira(S.user.savings)} · Wallet: ${naira(S.user.balance)}</p>
+      ${errBox()}
+      <form data-form="save" data-dir="${out ? 'out' : 'in'}">
+        ${amountField()}<button class="btn block">${out ? 'Withdraw' : 'Save'}</button>
+      </form>`);
+  }
+
+  const PROVIDERS = {
+    airtime: ['MTN', 'Airtel', 'Glo', '9mobile'],
+    data: ['MTN', 'Airtel', 'Glo', '9mobile'],
+    tv: ['DStv', 'GOtv', 'StarTimes'],
+    electricity: ['IKEDC', 'EKEDC', 'AEDC', 'PHED']
+  };
+
+  function sheetBill(cat) {
+    const label = {
+      airtime: 'Airtime',
+      data: 'Data',
+      tv: 'TV',
+      electricity: 'Electricity'
+    }[cat];
+
+    openSheet(`<h2>${label}</h2>
+      <p class="sub">Demo mode: the payment is recorded but not sent to a provider.</p>
+      ${errBox()}
+      <form data-form="bill" data-cat="${cat}">
+        <div class="chips" id="providers">
+          ${PROVIDERS[cat].map((p, i) =>
+            `<button type="button" class="chip ${i ? '' : 'on'}" data-act="pick" data-p="${p}">${p}</button>`
+          ).join('')}
+        </div>
+        <div class="field">
+          <label for="target">${cat === 'tv' ? 'Smartcard number' : cat === 'electricity' ? 'Meter number' : 'Phone number'}</label>
+          <input id="target" inputmode="numeric" required>
+        </div>
+        ${amountField()}
+        <button class="btn block">Pay</button>
+      </form>`);
+
+    $('#providers').dataset.value = PROVIDERS[cat][0];
+  }
+
+  function sheetMore() {
+    openSheet(`<h2>More</h2><p class="sub">Choose a service</p>
+      <div class="grid4" style="margin-top:8px">
+        ${act('bill', I.send, 'Airtime', 'data-cat="airtime"')}
+        ${act('bill', I.clock, 'Data', 'data-cat="data"')}
+        ${act('bill', I.user, 'TV', 'data-cat="tv"')}
+        ${act('bill', I.shield, 'Electricity', 'data-cat="electricity"')}
+      </div>`);
+  }
+
+  /* ---------- selfie demo ---------- */
+
+  function stopFaceCamera() {
+    if (faceStream) {
+      faceStream.getTracks().forEach(t => t.stop());
+      faceStream = null;
+    }
+  }
+
+  async function startFaceCamera() {
+    try {
+      if (!navigator.mediaDevices?.getUserMedia) {
+        throw new Error('Camera access requires HTTPS or localhost and a supported browser.');
+      }
+
+      stopFaceCamera();
+
+      faceStream = await navigator.mediaDevices.getUserMedia({
+        video: { facingMode: 'user' },
+        audio: false
+      });
+
+      const video = $('#face-video');
+
+      if (!video) {
+        stopFaceCamera();
+        return;
+      }
+
+      video.srcObject = faceStream;
+      video.style.display = 'block';
+      toast('Camera ready. Position your face and capture.');
+    } catch (err) {
+      S.error = err.message || 'Could not open camera. Check browser permissions.';
+      render();
+    }
+  }
+
+  function captureFace() {
+    const video = $('#face-video');
+    const canvas = $('#face-canvas');
+    const preview = $('#face-preview');
+
+    if (!video || !canvas || !video.videoWidth) {
+      toast('Open the camera first.');
+      return;
+    }
+
+    canvas.width = video.videoWidth;
+    canvas.height = video.videoHeight;
+    canvas.getContext('2d').drawImage(video, 0, 0, canvas.width, canvas.height);
+
+    const img = document.createElement('img');
+    img.src = canvas.toDataURL('image/jpeg', 0.82);
+    img.alt = 'Captured signup selfie';
+    img.style.cssText = 'display:block;width:100%;max-height:260px;object-fit:cover';
+
+    preview.replaceChildren(img);
+    S.faceCaptured = true;
+    stopFaceCamera();
+
+    toast('Selfie captured for this demo.');
+  }
+
+  function saveRegInputs() {
+    document.querySelectorAll('#register-step-form .reg-input').forEach(el => {
+      S.regData[el.id] = el.value;
+    });
+
+    const terms = $('#terms');
+    if (terms) S.regData.terms = terms.checked;
+  }
+
+  function validateRegStep() {
+    saveRegInputs();
+
+    const d = S.regData;
+    const required = {
+      1: ['firstName', 'lastName', 'dob', 'gender'],
+      2: [
+        'phone', 'email', 'address', 'city', 'state', 'country',
+        'occupation', 'sourceOfFunds', 'accountPurpose',
+        'nextOfKin', 'nextOfKinPhone'
+      ],
+      3: ['password', 'confirmPassword', 'pin', 'confirmPin']
+    };
+
+    for (const key of (required[S.regStep] || [])) {
+      if (!String(d[key] || '').trim()) {
+        throw new Error('Please complete all required fields on this step.');
+      }
+    }
+
+    if (S.regStep === 1 &&
+        (!/^\d{4}-\d{2}-\d{2}$/.test(d.dob) || ageFrom(d.dob) < 18)) {
+      throw new Error('You must be at least 18 years old to create this demo account.');
+    }
+
+    if (S.regStep === 2 && !/^[^\s@]+@[^\s@]+\.[^\s@]+$/.test(d.email)) {
+      throw new Error('Enter a valid email address.');
+    }
+
+    if (S.regStep === 3) {
+      if (d.password.length < 10 || !/[A-Za-z]/.test(d.password) || !/\d/.test(d.password)) {
+        throw new Error('Password must be at least 10 characters and include letters and numbers.');
+      }
+
+      if (d.password !== d.confirmPassword) {
+        throw new Error('Passwords do not match.');
+      }
+
+      if (!/^\d{4,6}$/.test(d.pin)) {
+        throw new Error('Transaction PIN must contain 4 to 6 digits.');
+      }
+
+      if (d.pin !== d.confirmPin) {
+        throw new Error('Transaction PINs do not match.');
+      }
+    }
+  }
+
+  /* ---------- events ---------- */
+
+  const $$ = (s) => [...document.querySelectorAll(s)];
+
+  document.addEventListener('click', (e) => {
+    const el = e.target.closest('[data-act]');
+    if (!el) return;
+
+    const a = el.dataset.act;
+
+    if (a === 'overlay') {
+      if (e.target === el) closeSheet();
+      return;
+    }
+
+    const go = (v) => {
+      S.view = v;
+      closeSheet();
+      render();
+      window.scrollTo(0, 0);
+    };
+
+    const actions = {
+      theme: toggleTheme,
+      close: closeSheet,
+      go: () => go(el.dataset.view),
+      history: () => go('history'),
+      logout: () => logout(),
+      hide: () => {
+        S.hide = !S.hide;
+        store.set('hide', S.hide ? '1' : '0');
+        render();
+      },
+      switch: () => {
+        S.authMode = S.authMode === 'login' ? 'register' : 'login';
+        S.error = '';
+        S.regStep = 1;
+        S.regData = {};
+        S.faceCaptured = false;
+        stopFaceCamera();
+        render();
+      },
+      'reg-back': () => {
+        saveRegInputs();
+        S.regStep = Math.max(1, S.regStep - 1);
+        S.error = '';
+        render();
+      },
+      'camera-start': startFaceCamera,
+      'camera-capture': captureFace,
+      topup: sheetTopup,
+      tovault: () => sheetTransfer(false),
+      tobank: () => sheetTransfer(true),
+      save: () => sheetSave(false),
+      unsave: () => sheetSave(true),
+      more: sheetMore,
+      bill: () => sheetBill(el.dataset.cat),
+      pick: () => {
+        $$('.chip').forEach(c => c.classList.remove('on'));
+        el.classList.add('on');
+
+        const providers = $('#providers');
+        if (providers) providers.dataset.value = el.dataset.p;
+      },
+      copy: () => {
+        navigator.clipboard?.writeText(S.user.accountNumber)
+          .then(() => toast('Account number copied'))
+          .catch(() => toast(S.user.accountNumber));
+      }
+    };
+
+    if (actions[a]) actions[a]();
+  });
+
+  // Internal Fubs account lookup.
+  document.addEventListener('input', async (e) => {
+    if (e.target.id !== 'acct' || $('#bankCode')) return;
+
+    const box = $('#recipient');
+    const value = e.target.value.replace(/\D/g, '');
+
+    if (value.length !== 10) {
+      if (box) box.innerHTML = '';
+      return;
+    }
+
+    try {
+      const result = await api('/api/lookup?account=' + value);
+
+      if (e.target.value.replace(/\D/g, '') === value && box) {
+        box.innerHTML = `<div class="recipient">
+          <strong>${esc(result.name)}</strong><br>
+          ${esc(result.bankName)} · ${esc(result.accountNumber)}
+        </div>`;
+      }
+    } catch (err) {
+      if (box) box.innerHTML = `<div class="err">${esc(err.message)}</div>`;
+    }
+  });
+
+  // Format naira amounts with thousands separators and two decimal places.
+  document.addEventListener('focusin', (e) => {
+    if (e.target.id === 'amt') {
+      e.target.value = e.target.value.replace(/,/g, '');
+    }
+  });
+
+  document.addEventListener('focusout', (e) => {
+    if (e.target.id !== 'amt') return;
+
+    const raw = e.target.value.trim().replace(/,/g, '');
+    if (!/^\d+(?:\.\d{0,2})?$/.test(raw) || raw === '') return;
+
+    const number = Number(raw);
+
+    if (Number.isFinite(number)) {
+      e.target.value = number.toLocaleString('en-NG', {
+        minimumFractionDigits: 2,
+        maximumFractionDigits: 2
+      });
+    }
+  });
+
+  document.addEventListener('submit', async (e) => {
+    e.preventDefault();
+
+    const f = e.target;
+    const btn = f.querySelector('button.btn');
+    const val = (id) => (f.querySelector('#' + id)?.value || '').trim();
+
+    if (btn) btn.disabled = true;
+
+    try {
+      if (f.id === 'auth-form') {
+        S.busy = true;
+        S.error = '';
+
+        const result = await api('/api/auth/login', 'POST', {
+          identifier: val('identifier'),
+          password: f.querySelector('#password').value
+        });
+
+        S.token = result.token;
+        store.set('token', result.token);
+        S.user = result.user;
+        S.view = 'home';
+        S.busy = false;
+        S.txs = await api('/api/transactions');
+
+        render();
+        toast(`Welcome back, ${result.user.firstName}`);
+        return;
+      }
+
+      if (f.id === 'register-step-form') {
+        S.error = '';
+
+        try {
+          validateRegStep();
+        } catch (err) {
+          S.error = err.message;
+          render();
+          return;
+        }
+
+        if (S.regStep < 4) {
+          S.regStep++;
+          render();
+          return;
+        }
+
+        if (!S.faceCaptured) {
+          throw new Error('Open the camera and capture a selfie first.');
+        }
+
+        if (!$('#terms')?.checked) {
+          throw new Error('Please accept the demo terms to continue.');
+        }
+
+        S.regData.terms = true;
+        S.busy = true;
+        render();
+
+        const d = S.regData;
+
+        const payload = {
+          firstName: d.firstName,
+          middleName: d.middleName,
+          lastName: d.lastName,
+          dob: d.dob,
+          gender: d.gender,
+          phone: d.phone,
+          email: d.email,
+          address: d.address,
+          city: d.city,
+          state: d.state,
+          country: d.country,
+          occupation: d.occupation,
+          sourceOfFunds: d.sourceOfFunds,
+          accountPurpose: d.accountPurpose,
+          nextOfKin: d.nextOfKin,
+          nextOfKinPhone: d.nextOfKinPhone,
+          password: d.password,
+          pin: d.pin,
+          faceCaptureCompleted: S.faceCaptured
+        };
+
+        const result = await api('/api/auth/register', 'POST', payload);
+
+        stopFaceCamera();
+
+        S.token = result.token;
+        store.set('token', result.token);
+        S.user = result.user;
+        S.view = 'home';
+        S.busy = false;
+        S.regData = {};
+        S.regStep = 1;
+        S.faceCaptured = false;
+        S.txs = await api('/api/transactions');
+
+        render();
+        toast(`Welcome, ${result.user.firstName}! Demo account created.`);
+        return;
+      }
+
+      const kind = f.dataset.form;
+      const amount = val('amt');
+
+      if (kind === 'transfer' && f.dataset.external === 'true') {
+        const bankCode = val('bankCode');
+        const accountNumber = val('acct').replace(/\D/g, '');
+        const box = $('#recipient');
+
+        if (box) box.innerHTML = '';
+
+        if (!bankCode) throw new Error('Please select the recipient bank.');
+
+        if (!/^\d{10}$/.test(accountNumber)) {
+          throw new Error('Enter a valid 10-digit account number.');
+        }
+
+        const result = await api(
+          '/api/resolve-account?' +
+          new URLSearchParams({ accountNumber, bankCode }).toString()
+        );
+
+        if (box) {
+          box.innerHTML = `<div class="recipient">
+            <strong>${esc(result.account.accountName)}</strong><br>
+            ${esc(accountNumber)} · Verified by Paystack
+          </div>
+          <p class="sub">Account details verified. This demo has not sent money.</p>`;
+        }
+
+        toast('Account name verified');
+
+        if (btn) btn.disabled = false;
+        return;
+      }
+
+      const calls = {
+        topup: () => api('/api/topup', 'POST', { amount }),
+        transfer: () => api('/api/transfer', 'POST', {
+          amount,
+          accountNumber: val('acct'),
+          note: val('note')
+        }),
+        save: () => api('/api/save', 'POST', {
+          amount,
+          direction: f.dataset.dir
+        }),
+        bill: () => api('/api/bills', 'POST', {
+          amount,
+          category: f.dataset.cat,
+          provider: $('#providers')?.dataset.value || '',
+          target: val('target')
+        })
+      };
+
+      if (!calls[kind]) throw new Error('Unknown action.');
+
+      S.user = await calls[kind]();
+      S.txs = await api('/api/transactions');
+
+      closeSheet();
+      render();
+      toast('Done ✓');
+    } catch (err) {
+      if (f.id === 'auth-form' || f.id === 'register-step-form') {
+        S.error = err.message;
+        S.busy = false;
+        render();
+      } else {
+        sheetErr(err.message);
+        if (btn) btn.disabled = false;
+      }
+    }
+  });
+
+  document.addEventListener('keydown', (e) => {
+    if (e.key === 'Escape') closeSheet();
+  });
+
+  load();
+}
+
+/* ================= WEB SERVER ================= */
+
+const PAGES = {
+  '/': ['text/html; charset=utf-8', INDEX_HTML],
+  '/styles.css': ['text/css', STYLES_CSS],
+  '/theme.js': ['text/javascript', THEME_JS],
+  '/app.js': ['text/javascript', '(' + clientApp.toString() + ')();']
+};
+
+const SEC = {
+  'X-Content-Type-Options': 'nosniff',
+  'X-Frame-Options': 'DENY',
+  'Referrer-Policy': 'no-referrer',
+  'Content-Security-Policy':
+    "default-src 'self'; style-src 'self' 'unsafe-inline'; img-src 'self' data:; frame-ancestors 'none'"
+};
+
+const send = (res, status, data, headers = {}) => {
+  const body =
+    typeof data === 'string' || Buffer.isBuffer(data)
+      ? data
+      : JSON.stringify(data);
+
+  res.writeHead(status, { ...SEC, ...headers });
+  res.end(body);
+};
+
+const readBody = (req) => new Promise((resolve, reject) => {
+  let s = '';
+
+  req.on('data', (chunk) => {
+    s += chunk;
+
+    if (s.length > 1e5) {
+      reject(new HttpError(413, 'Request body too large'));
+      req.destroy();
+    }
+  });
+
+  req.on('end', () => {
+    try {
+      resolve(s ? JSON.parse(s) : {});
+    } catch {
+      reject(new HttpError(400, 'Invalid JSON'));
+    }
+  });
+
+  req.on('error', reject);
+});
+
+http.createServer(async (req, res) => {
+  const url = new URL(req.url, 'http://localhost');
+
+  try {
+    if (url.pathname.startsWith('/api/')) {
+      const r = routes[`${req.method} ${url.pathname}`];
+
+      if (!r) throw new HttpError(404, 'Not found');
+
+      let uid = null;
+
+      if (r.auth) {
+        uid = verifyToken(
+          (req.headers.authorization || '').replace(/^Bearer /, '')
+        );
+
+        if (!uid || !profile(uid)) {
+          throw new HttpError(401, 'Please log in again');
+        }
+      }
+
+      const body = req.method === 'POST' ? await readBody(req) : {};
+
+      const out = await r.fn({
+        uid,
+        body,
+        query: url.searchParams,
+        ip: req.socket.remoteAddress
+      });
+
+      return send(
+        res,
+        out.status || 200,
+        out.data,
+        {
+          'Content-Type': 'application/json',
+          'Cache-Control': 'no-store'
+        }
+      );
+    }
+
+    const page = PAGES[url.pathname] || PAGES['/'];
+
+    return send(res, 200, page[1], {
+      'Content-Type': page[0]
+    });
+  } catch (err) {
+    if (!(err instanceof HttpError)) console.error(err);
+
+    return send(
+      res,
+      err.status || 500,
+      {
+        error: err instanceof HttpError
+          ? err.message
+          : 'Something went wrong'
+      },
+      { 'Content-Type': 'application/json' }
+    );
+  }
+}).listen(PORT, () => {
+  console.log(
+    `Fubs Online Banking running on http://localhost:${PORT} (demo app, not a real bank)`
+  );
+});
