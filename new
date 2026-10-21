@@ -1,0 +1,813 @@
+'use strict';
+/*
+  VAULTLY: demo banking app in ONE file (back end + front end).
+  Needs Node.js 22.5 or newer. No npm install.
+  Run:   node --no-warnings vaultly.js      then open http://localhost:3000
+*/
+const http = require('node:http');
+const path = require('node:path');
+const fs = require('node:fs');
+const crypto = require('node:crypto');
+const { DatabaseSync } = require('node:sqlite');
+
+/* ================= DATABASE ================= */
+
+fs.mkdirSync(path.join(__dirname, 'data'), { recursive: true });
+const db = new DatabaseSync(path.join(__dirname, 'data', 'bank.db'));
+db.exec('PRAGMA journal_mode = WAL; PRAGMA foreign_keys = ON;');
+db.exec(`
+CREATE TABLE IF NOT EXISTS users (
+  id            INTEGER PRIMARY KEY AUTOINCREMENT,
+  nin_hash      TEXT NOT NULL UNIQUE,   -- HMAC of the NIN, never the raw NIN
+  nin_last4     TEXT NOT NULL,
+  phone         TEXT NOT NULL UNIQUE,
+  email         TEXT NOT NULL UNIQUE,
+  password_hash TEXT NOT NULL,
+  first_name    TEXT NOT NULL,
+  middle_name   TEXT NOT NULL DEFAULT '',
+  last_name     TEXT NOT NULL,
+  dob           TEXT NOT NULL,          -- from NIN; age is always computed from this
+  gender        TEXT NOT NULL DEFAULT '',
+  address       TEXT NOT NULL,
+  created_at    TEXT NOT NULL DEFAULT (datetime('now'))
+);
+CREATE TABLE IF NOT EXISTS accounts (
+  user_id        INTEGER PRIMARY KEY REFERENCES users(id),
+  account_number TEXT NOT NULL UNIQUE,
+  balance        INTEGER NOT NULL DEFAULT 0 CHECK (balance >= 0),   -- kobo
+  savings        INTEGER NOT NULL DEFAULT 0 CHECK (savings >= 0)    -- kobo
+);
+CREATE TABLE IF NOT EXISTS transactions (
+  id            INTEGER PRIMARY KEY AUTOINCREMENT,
+  user_id       INTEGER NOT NULL REFERENCES users(id),
+  type          TEXT NOT NULL,          -- topup | transfer | save | bill
+  direction     TEXT NOT NULL,          -- credit | debit
+  amount        INTEGER NOT NULL,       -- kobo
+  balance_after INTEGER NOT NULL,
+  counterparty  TEXT NOT NULL DEFAULT '',
+  description   TEXT NOT NULL DEFAULT '',
+  reference     TEXT NOT NULL,
+  created_at    TEXT NOT NULL DEFAULT (datetime('now'))
+);
+CREATE INDEX IF NOT EXISTS idx_tx_user ON transactions(user_id, id DESC);
+`);
+
+function tx(fn) {            // run fn atomically
+  db.exec('BEGIN IMMEDIATE');
+  try { const r = fn(); db.exec('COMMIT'); return r; }
+  catch (e) { db.exec('ROLLBACK'); throw e; }
+}
+
+/* ================= NIN LOOKUP ================= */
+
+const PROVIDER = process.env.NIN_PROVIDER || 'mock';
+
+// FAKE test people, used only when NIN_PROVIDER=mock.
+const MOCK_NIN_DATA = {
+  '12345678901': {"firstName": "Amina", "middleName": "Zainab", "lastName": "Bello", "dob": "1995-03-14", "gender": "F", "phone": "08012345678", "address": "12 Allen Avenue, Ikeja, Lagos"},
+  '10987654321': {"firstName": "Chinedu", "middleName": "", "lastName": "Okafor", "dob": "1988-11-02", "gender": "M", "phone": "08098765432", "address": "45 Aba Road, Port Harcourt, Rivers"},
+  '11122233344': {"firstName": "Tunde", "middleName": "Ayodele", "lastName": "Adeyemi", "dob": "2001-07-21", "gender": "M", "phone": "07011122233", "address": "7 Ring Road, Ibadan, Oyo"},
+  '55566677788': {"firstName": "Test", "middleName": "", "lastName": "Minor", "dob": "2012-05-05", "gender": "F", "phone": "09055566677", "address": "1 Test Street, Abuja"},
+};
+
+async function lookupMock(nin) {
+  const r = MOCK_NIN_DATA[nin];
+  return r ? { nin, ...r } : null;
+}
+
+// Real provider (NIN_PROVIDER=http): set NIN_API_URL and NIN_API_KEY, then adapt
+// mapHttpResponse() to your provider's documented response (Dojah, Prembly, Smile ID, Youverify...).
+function mapHttpResponse(nin, body) {
+  const d = body.entity || body.data || body;
+  if (!d || !(d.first_name || d.firstName)) return null;
+  return {
+    nin,
+    firstName: d.first_name || d.firstName,
+    middleName: d.middle_name || d.middleName || '',
+    lastName: d.last_name || d.lastName || d.surname,
+    dob: normaliseDob(d.date_of_birth || d.birthdate || d.dob),
+    gender: String(d.gender || '').charAt(0).toUpperCase(),
+    phone: d.phone_number || d.phone || d.telephoneno || '',
+    address: [d.residence_address || d.address, d.residence_lga, d.residence_state].filter(Boolean).join(', ')
+  };
+}
+
+function normaliseDob(v) {
+  if (!v) return null;
+  const s = String(v);
+  if (/^\d{4}-\d{2}-\d{2}/.test(s)) return s.slice(0, 10);
+  const m = s.match(/^(\d{2})-(\d{2})-(\d{4})$/); // DD-MM-YYYY
+  return m ? `${m[3]}-${m[2]}-${m[1]}` : null;
+}
+
+async function lookupHttp(nin) {
+  const url = process.env.NIN_API_URL, key = process.env.NIN_API_KEY;
+  if (!url || !key) throw new Error('NIN provider not configured');
+  const res = await fetch(url, {
+    method: 'POST',
+    headers: { 'Content-Type': 'application/json', Authorization: `Bearer ${key}` },
+    body: JSON.stringify({ nin })
+  });
+  if (res.status === 404) return null;
+  if (!res.ok) throw new Error(`NIN provider error ${res.status}`);
+  return mapHttpResponse(nin, await res.json());
+}
+
+async function lookupNin(nin) {
+  return PROVIDER === 'http' ? lookupHttp(nin) : lookupMock(nin);
+}
+
+
+/* ================= BACK END ================= */
+const PORT = process.env.PORT || 3000;
+const SECRET = process.env.JWT_SECRET || crypto.randomBytes(32).toString('hex');
+if (!process.env.JWT_SECRET) console.warn('! JWT_SECRET not set: using a random one (logins reset on restart).');
+const NIN_PEPPER = process.env.NIN_PEPPER || SECRET;
+const DEMO_TOPUP = process.env.DEMO_TOPUP !== 'false';   // fake "Add Money"; replace with a payment gateway
+const REQUIRE_PHONE_MATCH = process.env.REQUIRE_PHONE_MATCH !== 'false';
+const MAX_TX_NAIRA = 5_000_000;
+
+/* ---------- helpers ---------- */
+class HttpError extends Error { constructor(status, msg) { super(msg); this.status = status; } }
+const b64 = (b) => Buffer.from(b).toString('base64url');
+const hmac = (s, k = SECRET) => crypto.createHmac('sha256', k).update(s).digest('base64url');
+
+function signToken(uid) {
+  const body = b64(JSON.stringify({ uid, exp: Date.now() + 7 * 864e5 }));
+  return `${body}.${hmac(body)}`;
+}
+function verifyToken(t) {
+  const [body, sig] = String(t || '').split('.');
+  if (!body || !sig) return null;
+  const good = hmac(body);
+  if (sig.length !== good.length || !crypto.timingSafeEqual(Buffer.from(sig), Buffer.from(good))) return null;
+  const p = JSON.parse(Buffer.from(body, 'base64url').toString());
+  return p.exp > Date.now() ? p.uid : null;
+}
+function hashPassword(pw) {
+  const salt = crypto.randomBytes(16);
+  return `${salt.toString('hex')}:${crypto.scryptSync(pw, salt, 64).toString('hex')}`;
+}
+function checkPassword(pw, stored) {
+  const [salt, hash] = stored.split(':');
+  const h = crypto.scryptSync(pw, Buffer.from(salt, 'hex'), 64);
+  return crypto.timingSafeEqual(h, Buffer.from(hash, 'hex'));
+}
+const ninHash = (nin) => hmac(nin, NIN_PEPPER);
+const ref = () => 'TX' + Date.now().toString(36).toUpperCase() + crypto.randomBytes(3).toString('hex').toUpperCase();
+
+function normPhone(p) {
+  let s = String(p || '').replace(/[\s-]/g, '');
+  if (s.startsWith('+234')) s = '0' + s.slice(4);
+  else if (s.startsWith('234') && s.length === 13) s = '0' + s.slice(3);
+  return /^0[789][01]\d{8}$/.test(s) ? s : null;
+}
+function ageFrom(dob) {
+  const d = new Date(dob), n = new Date();
+  let a = n.getFullYear() - d.getFullYear();
+  if (n < new Date(n.getFullYear(), d.getMonth(), d.getDate())) a--;
+  return a;
+}
+function toKobo(v) {
+  const n = Number(v);
+  if (!Number.isFinite(n) || n <= 0) throw new HttpError(400, 'Enter a valid amount');
+  if (n > MAX_TX_NAIRA) throw new HttpError(400, `Maximum per transaction is ₦${MAX_TX_NAIRA.toLocaleString()}`);
+  return Math.round(n * 100);
+}
+function profile(uid) {
+  const u = db.prepare(`SELECT u.*, a.account_number, a.balance, a.savings FROM users u JOIN accounts a ON a.user_id=u.id WHERE u.id=?`).get(uid);
+  if (!u) return null;
+  return {
+    id: u.id,
+    fullName: [u.first_name, u.middle_name, u.last_name].filter(Boolean).join(' '),
+    firstName: u.first_name, dob: u.dob, age: ageFrom(u.dob), gender: u.gender,
+    address: u.address, phone: u.phone, email: u.email, ninLast4: u.nin_last4,
+    accountNumber: u.account_number, balance: u.balance, savings: u.savings
+  };
+}
+function newAccountNumber() {
+  for (;;) {
+    const n = '30' + String(crypto.randomInt(0, 1e8)).padStart(8, '0');
+    if (!db.prepare('SELECT 1 FROM accounts WHERE account_number=?').get(n)) return n;
+  }
+}
+
+/* in-memory rate limiter: max `n` hits per `ms` per key */
+const hits = new Map();
+function limit(key, n, ms) {
+  const now = Date.now(), arr = (hits.get(key) || []).filter((t) => now - t < ms);
+  arr.push(now); hits.set(key, arr);
+  if (arr.length > n) throw new HttpError(429, 'Too many attempts. Please wait and try again.');
+}
+setInterval(() => { const now = Date.now(); for (const [k, v] of hits) if (!v.some((t) => now - t < 36e5)) hits.delete(k); }, 6e5).unref();
+
+/* ---------- route handlers ---------- */
+const routes = {};
+const route = (method, p, auth, fn) => (routes[`${method} ${p}`] = { auth, fn });
+
+route('POST', '/api/auth/register', false, async ({ body, ip }) => {
+  limit('reg:' + ip, 10, 36e5);
+  const nin = String(body.nin || '').trim();
+  const phone = normPhone(body.phone);
+  const email = String(body.email || '').trim().toLowerCase();
+  const password = String(body.password || '');
+  if (!/^\d{11}$/.test(nin)) throw new HttpError(400, 'NIN must be 11 digits');
+  if (!phone) throw new HttpError(400, 'Enter a valid Nigerian phone number');
+  if (!/^[a-z0-9._%+-]+@gmail\.com$/.test(email)) throw new HttpError(400, 'Enter a valid Gmail address (name@gmail.com)');
+  if (password.length < 8) throw new HttpError(400, 'Password must be at least 8 characters');
+
+  const h = ninHash(nin);
+  if (db.prepare('SELECT 1 FROM users WHERE nin_hash=? OR phone=? OR email=?').get(h, phone, email))
+    throw new HttpError(409, 'An account already exists with this NIN, phone number or email');
+
+  // Everything else (name, age, address, gender) comes from the NIN record, not from the user.
+  let rec;
+  try { rec = await lookupNin(nin); } catch (e) { console.error(e); throw new HttpError(502, 'NIN verification is unavailable right now. Try again shortly.'); }
+  if (!rec) throw new HttpError(422, 'We could not find this NIN. Check the number and try again.');
+  if (REQUIRE_PHONE_MATCH && normPhone(rec.phone) !== phone)
+    throw new HttpError(422, 'This phone number does not match the one linked to your NIN.');
+  if (!rec.dob || ageFrom(rec.dob) < 18) throw new HttpError(403, 'You must be at least 18 years old to open an account.');
+
+  const uid = tx(() => {
+    const r = db.prepare(`INSERT INTO users (nin_hash,nin_last4,phone,email,password_hash,first_name,middle_name,last_name,dob,gender,address)
+      VALUES (?,?,?,?,?,?,?,?,?,?,?)`).run(h, nin.slice(-4), phone, email, hashPassword(password),
+      rec.firstName, rec.middleName || '', rec.lastName, rec.dob, rec.gender || '', rec.address || '');
+    db.prepare('INSERT INTO accounts (user_id, account_number) VALUES (?,?)').run(r.lastInsertRowid, newAccountNumber());
+    return Number(r.lastInsertRowid);
+  });
+  return { status: 201, data: { token: signToken(uid), user: profile(uid) } };
+});
+
+route('POST', '/api/auth/login', false, async ({ body, ip }) => {
+  limit('login:' + ip, 15, 15 * 6e4);
+  const id = String(body.identifier || '').trim().toLowerCase();
+  const u = db.prepare('SELECT * FROM users WHERE email=? OR phone=?').get(id, normPhone(id) || '__none__');
+  if (!u || !checkPassword(String(body.password || ''), u.password_hash)) throw new HttpError(401, 'Incorrect login details');
+  return { data: { token: signToken(u.id), user: profile(u.id) } };
+});
+
+route('GET', '/api/me', true, ({ uid }) => ({ data: profile(uid) }));
+
+route('GET', '/api/transactions', true, ({ uid, query }) => {
+  const lim = Math.min(Number(query.get('limit')) || 50, 200);
+  return { data: db.prepare('SELECT id,type,direction,amount,balance_after,counterparty,description,reference,created_at FROM transactions WHERE user_id=? ORDER BY id DESC LIMIT ?').all(uid, lim) };
+});
+
+route('GET', '/api/lookup', true, ({ query }) => {
+  const acct = String(query.get('account') || '');
+  if (!/^\d{10}$/.test(acct)) throw new HttpError(400, 'Account number must be 10 digits');
+  const r = db.prepare('SELECT u.first_name, u.last_name FROM accounts a JOIN users u ON u.id=a.user_id WHERE a.account_number=?').get(acct);
+  if (!r) throw new HttpError(404, 'Account not found');
+  return { data: { name: `${r.first_name} ${r.last_name}`, accountNumber: acct } };
+});
+
+route('POST', '/api/topup', true, ({ uid, body }) => {
+  if (!DEMO_TOPUP) throw new HttpError(501, 'Funding requires a payment gateway integration');
+  const amt = toKobo(body.amount);
+  tx(() => {
+    db.prepare('UPDATE accounts SET balance=balance+? WHERE user_id=?').run(amt, uid);
+    const bal = db.prepare('SELECT balance FROM accounts WHERE user_id=?').get(uid).balance;
+    db.prepare(`INSERT INTO transactions (user_id,type,direction,amount,balance_after,counterparty,description,reference) VALUES (?,?,?,?,?,?,?,?)`)
+      .run(uid, 'topup', 'credit', amt, bal, 'Wallet funding', 'Add money (demo)', ref());
+  });
+  return { data: profile(uid) };
+});
+
+route('POST', '/api/transfer', true, ({ uid, body }) => {
+  limit('xfer:' + uid, 30, 6e4);
+  const amt = toKobo(body.amount);
+  const to = String(body.accountNumber || '');
+  const note = String(body.note || '').slice(0, 100);
+  tx(() => {
+    const me = db.prepare('SELECT * FROM accounts WHERE user_id=?').get(uid);
+    const dest = db.prepare('SELECT a.*, u.first_name, u.last_name FROM accounts a JOIN users u ON u.id=a.user_id WHERE a.account_number=?').get(to);
+    if (!dest) throw new HttpError(404, 'Recipient account not found');
+    if (dest.user_id === uid) throw new HttpError(400, 'You cannot transfer to yourself');
+    if (me.balance < amt) throw new HttpError(400, 'Insufficient balance');
+    const sender = db.prepare('SELECT first_name,last_name FROM users WHERE id=?').get(uid);
+    const r = ref();
+    db.prepare('UPDATE accounts SET balance=balance-? WHERE user_id=?').run(amt, uid);
+    db.prepare('UPDATE accounts SET balance=balance+? WHERE user_id=?').run(amt, dest.user_id);
+    const insert = db.prepare(`INSERT INTO transactions (user_id,type,direction,amount,balance_after,counterparty,description,reference) VALUES (?,?,?,?,?,?,?,?)`);
+    insert.run(uid, 'transfer', 'debit', amt, me.balance - amt, `${dest.first_name} ${dest.last_name}`, note || 'Transfer', r);
+    insert.run(dest.user_id, 'transfer', 'credit', amt, dest.balance + amt, `${sender.first_name} ${sender.last_name}`, note || 'Transfer', r);
+  });
+  return { data: profile(uid) };
+});
+
+route('POST', '/api/save', true, ({ uid, body }) => {
+  const amt = toKobo(body.amount);
+  const out = body.direction === 'out';
+  tx(() => {
+    const a = db.prepare('SELECT * FROM accounts WHERE user_id=?').get(uid);
+    if (out ? a.savings < amt : a.balance < amt) throw new HttpError(400, out ? 'Not enough in savings' : 'Insufficient balance');
+    const bal = a.balance + (out ? amt : -amt);
+    db.prepare('UPDATE accounts SET balance=?, savings=savings+? WHERE user_id=?').run(bal, out ? -amt : amt, uid);
+    db.prepare(`INSERT INTO transactions (user_id,type,direction,amount,balance_after,counterparty,description,reference) VALUES (?,?,?,?,?,?,?,?)`)
+      .run(uid, 'save', out ? 'credit' : 'debit', amt, bal, 'Savings', out ? 'Withdrawn from savings' : 'Moved to savings', ref());
+  });
+  return { data: profile(uid) };
+});
+
+const BILLS = { airtime: 'Airtime', data: 'Data', tv: 'TV', electricity: 'Electricity' };
+route('POST', '/api/bills', true, ({ uid, body }) => {
+  limit('bill:' + uid, 30, 6e4);
+  const cat = String(body.category || '');
+  if (!BILLS[cat]) throw new HttpError(400, 'Unknown bill category');
+  const provider = String(body.provider || '').slice(0, 40);
+  const target = String(body.target || '').replace(/[^\w-]/g, '').slice(0, 20);
+  if (!provider || !target) throw new HttpError(400, 'Provider and number are required');
+  const amt = toKobo(body.amount);
+  // NOTE: demo only. Real bill payment needs an aggregator API (VTpass, Flutterwave Bills, etc.).
+  tx(() => {
+    const a = db.prepare('SELECT balance FROM accounts WHERE user_id=?').get(uid);
+    if (a.balance < amt) throw new HttpError(400, 'Insufficient balance');
+    db.prepare('UPDATE accounts SET balance=balance-? WHERE user_id=?').run(amt, uid);
+    db.prepare(`INSERT INTO transactions (user_id,type,direction,amount,balance_after,counterparty,description,reference) VALUES (?,?,?,?,?,?,?,?)`)
+      .run(uid, 'bill', 'debit', amt, a.balance - amt, provider, `${BILLS[cat]} - ${target}`, ref());
+  });
+  return { data: profile(uid) };
+});
+
+
+/* ================= FRONT END (sent to the browser) ================= */
+const INDEX_HTML = String.raw`<!doctype html>
+<html lang="en" data-theme="dark">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1, viewport-fit=cover">
+  <meta name="theme-color" content="#05070d">
+  <title>Vaultly</title>
+  <link rel="stylesheet" href="/styles.css">
+  <script src="/theme.js"></script>
+</head>
+<body>
+  <div id="app" aria-live="polite"></div>
+  <div id="sheet-root"></div>
+  <div id="toast" role="status"></div>
+  <script src="/app.js"></script>
+</body>
+</html>
+`;
+
+const STYLES_CSS = String.raw`:root, [data-theme="dark"] {
+  --bg: #05070d; --surface: #0d1322; --surface-2: #141c33; --line: #1b2644;
+  --text: #f2f5ff; --muted: #8b97b8; --blue: #2f6bff; --blue-2: #1746d6; --blue-soft: #12224d;
+  --on-blue: #fff; --green: #2fd19b; --red: #ff6b7d; --shadow: 0 10px 30px rgba(0,0,0,.45);
+  color-scheme: dark;
+}
+[data-theme="light"] {
+  --bg: #ffffff; --surface: #f3f6ff; --surface-2: #e8eeff; --line: #dbe3fb;
+  --text: #0b1430; --muted: #5d6b91; --blue: #2f6bff; --blue-2: #1746d6; --blue-soft: #dde7ff;
+  --on-blue: #fff; --green: #0e9f6e; --red: #d93a50; --shadow: 0 10px 30px rgba(47,107,255,.15);
+  color-scheme: light;
+}
+* { box-sizing: border-box; -webkit-tap-highlight-color: transparent; }
+html, body { margin: 0; background: var(--bg); color: var(--text); font-family: system-ui, -apple-system, "Segoe UI", Roboto, sans-serif; }
+body { min-height: 100vh; }
+button { font: inherit; color: inherit; cursor: pointer; border: 0; background: none; }
+input, select { font: inherit; color: var(--text); }
+.app { max-width: 480px; margin: 0 auto; min-height: 100vh; padding: 16px 16px 96px; }
+
+/* header */
+.top { display: flex; align-items: center; gap: 12px; margin-bottom: 18px; }
+.avatar { width: 44px; height: 44px; border-radius: 50%; background: linear-gradient(135deg, var(--blue), #7aa2ff); display: grid; place-items: center; font-weight: 700; color: #fff; }
+.hi { font-size: 18px; font-weight: 700; flex: 1; min-width: 0; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+.icon-btn { width: 40px; height: 40px; border-radius: 50%; display: grid; place-items: center; color: var(--text); background: var(--surface); }
+.icon-btn svg { width: 22px; height: 22px; }
+
+/* balance card */
+.balance { background: linear-gradient(135deg, var(--blue), var(--blue-2)); color: var(--on-blue); border-radius: 22px 22px 0 0; padding: 18px 18px 20px; position: relative; box-shadow: var(--shadow); }
+.balance .row { display: flex; justify-content: space-between; align-items: flex-start; }
+.balance .lbl { display: flex; align-items: center; gap: 8px; font-size: 15px; opacity: .95; }
+.balance .lbl svg { width: 20px; height: 20px; }
+.amount { font-size: 30px; font-weight: 800; margin: 14px 0 10px; letter-spacing: -.5px; }
+.amount small { font-size: 20px; font-weight: 700; opacity: .85; }
+.earn { font-size: 15px; opacity: .95; }
+.pill { border: 1.5px solid rgba(255,255,255,.55); border-radius: 999px; padding: 9px 16px; font-weight: 600; color: #fff; }
+.last { background: var(--surface); border: 1px solid var(--line); border-top: 0; border-radius: 0 0 22px 22px; padding: 14px 16px; display: flex; align-items: center; gap: 10px; font-size: 14px; margin-bottom: 14px; }
+.last .txt { flex: 1; min-width: 0; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+.link { color: var(--muted); display: flex; align-items: center; gap: 4px; }
+
+.strip { width: 100%; text-align: left; background: var(--surface); border: 1px solid var(--line); border-radius: 16px; padding: 14px 16px; display: flex; align-items: center; gap: 10px; margin-bottom: 14px; font-size: 15px; }
+.strip .grow { flex: 1; }
+.strip b { color: var(--blue); }
+
+.panel { background: var(--surface); border: 1px solid var(--line); border-radius: 20px; padding: 18px 10px; margin-bottom: 14px; }
+.grid3 { display: grid; grid-template-columns: repeat(3, 1fr); gap: 6px; }
+.grid4 { display: grid; grid-template-columns: repeat(4, 1fr); gap: 14px 4px; }
+.act { display: flex; flex-direction: column; align-items: center; gap: 8px; font-size: 14px; color: var(--muted); }
+.act .ic { width: 62px; height: 62px; border-radius: 18px; background: var(--surface-2); display: grid; place-items: center; color: var(--blue); }
+.act .ic svg { width: 30px; height: 30px; }
+.grid4 .act .ic { width: 52px; height: 52px; border-radius: 50%; }
+.grid4 .act .ic svg { width: 26px; height: 26px; }
+.grid4 .act { font-size: 13px; }
+.grid3 .act { color: var(--text); font-size: 15px; }
+
+.promo { border-radius: 20px; padding: 18px; background: linear-gradient(135deg, var(--blue-soft), var(--surface)); border: 1px solid var(--line); margin-bottom: 14px; }
+.promo h3 { margin: 0 0 12px; font-size: 18px; }
+.promo .in { display: flex; align-items: center; justify-content: space-between; gap: 12px; border-top: 1px dashed var(--line); padding-top: 14px; }
+.promo p { margin: 2px 0 0; color: var(--muted); font-size: 14px; }
+.btn { background: var(--blue); color: #fff; border-radius: 999px; padding: 12px 28px; font-weight: 700; }
+.btn.block { width: 100%; padding: 15px; border-radius: 14px; font-size: 16px; }
+.btn.ghost { background: var(--surface-2); color: var(--text); }
+.btn[disabled] { opacity: .6; cursor: progress; }
+
+/* tabs */
+.tabs { position: fixed; left: 0; right: 0; bottom: 0; background: var(--surface); border-top: 1px solid var(--line); padding-bottom: env(safe-area-inset-bottom); }
+.tabs > div { max-width: 480px; margin: 0 auto; display: grid; grid-template-columns: repeat(4, 1fr); }
+.tab { padding: 10px 0 12px; display: flex; flex-direction: column; align-items: center; gap: 4px; font-size: 13px; color: var(--muted); }
+.tab svg { width: 26px; height: 26px; }
+.tab.on { color: var(--blue); font-weight: 700; }
+
+/* lists & pages */
+h1.pg { font-size: 22px; margin: 4px 0 16px; }
+.list { background: var(--surface); border: 1px solid var(--line); border-radius: 18px; overflow: hidden; margin-bottom: 14px; }
+.item { display: flex; align-items: center; gap: 12px; padding: 14px 16px; border-bottom: 1px solid var(--line); }
+.item:last-child { border-bottom: 0; }
+.item .ic { width: 40px; height: 40px; border-radius: 50%; background: var(--surface-2); color: var(--blue); display: grid; place-items: center; flex: none; }
+.item .ic svg { width: 20px; height: 20px; }
+.item .mid { flex: 1; min-width: 0; }
+.item .mid b { display: block; font-size: 15px; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+.item .mid span { font-size: 12.5px; color: var(--muted); }
+.cr { color: var(--green); font-weight: 700; } .dr { color: var(--text); font-weight: 700; }
+.kv { display: flex; justify-content: space-between; gap: 16px; padding: 13px 16px; border-bottom: 1px solid var(--line); font-size: 15px; }
+.kv:last-child { border-bottom: 0; } .kv span:first-child { color: var(--muted); } .kv span:last-child { text-align: right; }
+.badge { display: inline-flex; align-items: center; gap: 6px; background: var(--blue-soft); color: var(--blue); padding: 5px 10px; border-radius: 999px; font-size: 12.5px; font-weight: 700; }
+.empty { text-align: center; color: var(--muted); padding: 28px 12px; }
+
+/* auth */
+.auth { max-width: 420px; margin: 0 auto; padding: 28px 18px 40px; min-height: 100vh; display: flex; flex-direction: column; justify-content: center; }
+.logo { width: 56px; height: 56px; border-radius: 16px; background: linear-gradient(135deg, var(--blue), var(--blue-2)); display: grid; place-items: center; color: #fff; margin-bottom: 18px; }
+.logo svg { width: 30px; height: 30px; }
+.auth h1 { font-size: 28px; margin: 0 0 6px; } .auth p.sub { color: var(--muted); margin: 0 0 22px; line-height: 1.45; }
+.field { margin-bottom: 14px; }
+.field label { display: block; font-size: 13px; color: var(--muted); margin-bottom: 6px; }
+.field input { width: 100%; background: var(--surface); border: 1.5px solid var(--line); border-radius: 12px; padding: 14px; outline: 0; }
+.field input:focus { border-color: var(--blue); }
+.hint { font-size: 12.5px; color: var(--muted); margin-top: 5px; }
+.err { background: rgba(255,107,125,.12); color: var(--red); border-radius: 10px; padding: 10px 12px; font-size: 14px; margin-bottom: 14px; }
+.info { background: var(--blue-soft); color: var(--text); border-radius: 12px; padding: 12px 14px; font-size: 13.5px; line-height: 1.45; margin-bottom: 16px; }
+.switch { text-align: center; margin-top: 18px; color: var(--muted); } .switch button { color: var(--blue); font-weight: 700; }
+
+/* bottom sheet */
+.overlay { position: fixed; inset: 0; background: rgba(0,0,0,.55); display: flex; align-items: flex-end; justify-content: center; z-index: 20; }
+.sheet { background: var(--bg); width: 100%; max-width: 480px; max-height: 92vh; overflow: auto; border-radius: 24px 24px 0 0; padding: 18px 18px 28px; border: 1px solid var(--line); animation: up .2s ease-out; }
+@keyframes up { from { transform: translateY(40px); opacity: 0; } }
+.sheet h2 { margin: 0 0 4px; font-size: 20px; } .sheet .x { float: right; }
+.sheet .sub { color: var(--muted); font-size: 14px; margin: 0 0 16px; }
+.chips { display: flex; flex-wrap: wrap; gap: 8px; margin-bottom: 14px; }
+.chip { padding: 9px 14px; border-radius: 999px; background: var(--surface); border: 1.5px solid var(--line); font-size: 14px; }
+.chip.on { border-color: var(--blue); color: var(--blue); background: var(--blue-soft); font-weight: 700; }
+.recipient { background: var(--blue-soft); color: var(--blue); font-weight: 700; padding: 10px 12px; border-radius: 10px; margin-bottom: 14px; font-size: 14px; }
+#toast { position: fixed; left: 50%; bottom: 90px; transform: translateX(-50%) translateY(20px); background: var(--text); color: var(--bg); padding: 11px 18px; border-radius: 999px; font-size: 14px; opacity: 0; pointer-events: none; transition: .25s; z-index: 40; max-width: 90vw; }
+#toast.show { opacity: 1; transform: translateX(-50%); }
+`;
+
+const THEME_JS = "try { document.documentElement.dataset.theme = localStorage.getItem('theme') || 'dark'; } catch (e) {}";
+
+// The browser script is written as a normal function, then sent to the browser as text.
+function clientApp() {
+  /* ---------- tiny helpers ---------- */
+  const $ = (s, r = document) => r.querySelector(s);
+  const esc = (s) => String(s ?? '').replace(/[&<>"']/g, (c) => ({ '&': '&amp;', '<': '&lt;', '>': '&gt;', '"': '&quot;', "'": '&#39;' }[c]));
+  const store = {
+    get(k) { try { return localStorage.getItem(k); } catch { return null; } },
+    set(k, v) { try { localStorage.setItem(k, v); } catch {} },
+    del(k) { try { localStorage.removeItem(k); } catch {} }
+  };
+  const fmt = (kobo) => (kobo / 100).toLocaleString('en-NG', { minimumFractionDigits: 2, maximumFractionDigits: 2 });
+  const naira = (kobo) => '₦' + fmt(kobo);
+  const ico = (p) => `<svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.9" stroke-linecap="round" stroke-linejoin="round">${p}</svg>`;
+  const I = {
+    user: ico('<circle cx="12" cy="8" r="4"/><path d="M4 21c1-4 4-6 8-6s7 2 8 6"/>'),
+    bank: ico('<path d="M3 10l9-6 9 6"/><path d="M5 10v8M9 10v8M15 10v8M19 10v8M3 20h18"/>'),
+    safe: ico('<rect x="3" y="4" width="18" height="15" rx="3"/><circle cx="12" cy="11.5" r="3"/><path d="M7 19v2M17 19v2"/>'),
+    phone: ico('<rect x="7" y="2.5" width="10" height="19" rx="2.5"/><path d="M11 18.5h2"/>'),
+    data: ico('<path d="M8 4v14M8 18l-3-3M8 18l3-3M16 20V6M16 6l-3 3M16 6l3 3"/>'),
+    tv: ico('<rect x="3" y="7" width="18" height="13" rx="2"/><path d="M8 3l4 4 4-4"/>'),
+    bolt: ico('<path d="M13 2L5 14h6l-1 8 8-12h-6z"/>'),
+    piggy: ico('<path d="M5 12a7 6 0 0 1 12-3h2v4l-2 1v3h-3v-2H9v2H6v-3a5 5 0 0 1-1-2z"/><circle cx="14" cy="10" r=".6"/>'),
+    coins: ico('<circle cx="9" cy="9" r="5"/><path d="M15 6a5 5 0 1 1-3 9"/>'),
+    gift: ico('<rect x="3" y="9" width="18" height="12" rx="2"/><path d="M12 9v12M3 13h18M12 9c-3 0-4-5-1-5 2 0 1 5 1 5zm0 0c3 0 4-5 1-5-2 0-1 5-1 5z"/>'),
+    more: ico('<circle cx="5" cy="12" r="1.5"/><circle cx="12" cy="12" r="1.5"/><circle cx="19" cy="12" r="1.5"/>'),
+    eye: ico('<path d="M2 12s4-7 10-7 10 7 10 7-4 7-10 7S2 12 2 12z"/><circle cx="12" cy="12" r="3"/>'),
+    eyeOff: ico('<path d="M3 3l18 18M10.6 5.1A9.6 9.6 0 0 1 12 5c6 0 10 7 10 7a17 17 0 0 1-3.2 3.9M6.6 6.6A17 17 0 0 0 2 12s4 7 10 7a9.7 9.7 0 0 0 4.2-1"/>'),
+    shield: ico('<path d="M12 3l8 3v6c0 5-3.5 8-8 9-4.5-1-8-4-8-9V6z"/><path d="M8.5 12l2.5 2.5 4.5-5"/>'),
+    chev: ico('<path d="M9 5l7 7-7 7"/>'),
+    plus: ico('<path d="M12 5v14M5 12h14"/>'),
+    sun: ico('<circle cx="12" cy="12" r="4"/><path d="M12 2v2M12 20v2M2 12h2M20 12h2M5 5l1.5 1.5M17.5 17.5L19 19M5 19l1.5-1.5M17.5 6.5L19 5"/>'),
+    moon: ico('<path d="M20 14.5A8 8 0 0 1 9.5 4 8 8 0 1 0 20 14.5z"/>'),
+    home: ico('<path d="M3 11l9-8 9 8"/><path d="M5 10v10h5v-6h4v6h5V10"/>'),
+    star: ico('<path d="M12 3l2.7 5.6 6.1.9-4.4 4.3 1 6.1-5.4-2.9-5.4 2.9 1-6.1L3.2 9.5l6.1-.9z"/>'),
+    chart: ico('<path d="M4 4v16h16"/><path d="M8 15l4-4 3 3 5-6"/>'),
+    me: ico('<circle cx="12" cy="12" r="9"/><path d="M8 14c1 1.5 2.5 2 4 2s3-.5 4-2"/>'),
+    x: ico('<path d="M6 6l12 12M18 6L6 18"/>'),
+    arrowUp: ico('<path d="M12 19V5M6 11l6-6 6 6"/>'),
+    arrowDown: ico('<path d="M12 5v14M6 13l6 6 6-6"/>'),
+    logo: ico('<path d="M4 8l8-4 8 4v3c0 5-3.5 8-8 9-4.5-1-8-4-8-9z"/><path d="M9 12l2 2 4-4"/>')
+  };
+
+  /* ---------- state & api ---------- */
+  const S = { token: store.get('token'), user: null, txs: [], view: 'home', authMode: 'login', hide: store.get('hide') === '1', error: '', busy: false };
+
+  async function api(path, method = 'GET', body) {
+    const res = await fetch(path, {
+      method,
+      headers: { 'Content-Type': 'application/json', ...(S.token ? { Authorization: 'Bearer ' + S.token } : {}) },
+      body: body ? JSON.stringify(body) : undefined
+    });
+    const data = await res.json().catch(() => ({}));
+    if (res.status === 401 && S.token) logout(true);
+    if (!res.ok) throw new Error(data.error || 'Request failed');
+    return data;
+  }
+  function toast(msg) {
+    const t = $('#toast'); t.textContent = msg; t.classList.add('show');
+    clearTimeout(toast.t); toast.t = setTimeout(() => t.classList.remove('show'), 2600);
+  }
+  function setTheme(next) {
+    document.documentElement.dataset.theme = next; store.set('theme', next);
+    document.querySelector('meta[name=theme-color]').content = next === 'dark' ? '#05070d' : '#ffffff';
+  }
+  const toggleTheme = () => { setTheme(document.documentElement.dataset.theme === 'dark' ? 'light' : 'dark'); render(); };
+  function logout(silent) { store.del('token'); S.token = null; S.user = null; S.authMode = 'login'; closeSheet(); render(); if (!silent) toast('Logged out'); }
+
+  async function load() {
+    if (!S.token) return render();
+    try {
+      S.user = await api('/api/me');
+      S.txs = await api('/api/transactions');
+    } catch { /* api() handles 401 */ }
+    render();
+  }
+
+  /* ---------- views ---------- */
+  function themeBtn() {
+    const dark = document.documentElement.dataset.theme === 'dark';
+    return `<button class="icon-btn" data-act="theme" aria-label="Switch to ${dark ? 'white and blue' : 'black and blue'} theme">${dark ? I.sun : I.moon}</button>`;
+  }
+
+  function authView() {
+    const reg = S.authMode === 'register';
+    return `<div class="auth">
+      <div style="display:flex;justify-content:space-between;align-items:flex-start"><div class="logo">${I.logo}</div>${themeBtn()}</div>
+      <h1>${reg ? 'Open your account' : 'Welcome back'}</h1>
+      <p class="sub">${reg ? 'Just your NIN, phone number and Gmail. We fill in your name, age and address from your NIN.' : 'Log in with your phone number or Gmail.'}</p>
+      ${S.error ? `<div class="err">${esc(S.error)}</div>` : ''}
+      <form id="auth-form" autocomplete="on" novalidate>
+        ${reg ? `
+          <div class="field"><label for="nin">NIN (11 digits)</label><input id="nin" inputmode="numeric" maxlength="11" autocomplete="off" required></div>
+          <div class="field"><label for="phone">Phone number</label><input id="phone" type="tel" inputmode="tel" placeholder="08012345678" autocomplete="tel" required><div class="hint">Must match the number linked to your NIN.</div></div>
+          <div class="field"><label for="email">Gmail address</label><input id="email" type="email" placeholder="you@gmail.com" autocomplete="email" required></div>
+          <div class="field"><label for="password">Create password</label><input id="password" type="password" minlength="8" autocomplete="new-password" required><div class="hint">At least 8 characters. Used to log in.</div></div>
+          <div class="info">${I.shield.replace('<svg', '<svg width="16" height="16" style="vertical-align:-3px;margin-right:6px"')}Your name, date of birth (age), gender and address are pulled from your NIN record and can't be edited.</div>`
+        : `
+          <div class="field"><label for="identifier">Phone number or Gmail</label><input id="identifier" autocomplete="username" required></div>
+          <div class="field"><label for="password">Password</label><input id="password" type="password" autocomplete="current-password" required></div>`}
+        <button class="btn block" ${S.busy ? 'disabled' : ''}>${S.busy ? 'Please wait…' : reg ? 'Verify NIN & create account' : 'Log in'}</button>
+      </form>
+      <div class="switch">${reg ? 'Already have an account?' : 'New here?'} <button data-act="switch">${reg ? 'Log in' : 'Create account'}</button></div>
+    </div>`;
+  }
+
+  const TX_ICON = { topup: I.plus, transfer: I.bank, save: I.safe, bill: I.bolt };
+  function txRow(t) {
+    const cr = t.direction === 'credit';
+    const when = new Date(t.created_at.replace(' ', 'T') + 'Z').toLocaleString('en-NG', { day: 'numeric', month: 'short', hour: '2-digit', minute: '2-digit' });
+    return `<div class="item"><div class="ic">${TX_ICON[t.type] || I.coins}</div>
+      <div class="mid"><b>${esc(t.counterparty || t.description)}</b><span>${esc(t.description)} · ${when}</span></div>
+      <div class="${cr ? 'cr' : 'dr'}">${cr ? '+' : '-'}${naira(t.amount)}</div></div>`;
+  }
+  const act = (a, icon, label, extra = '') => `<button class="act" data-act="${a}" ${extra}><span class="ic">${icon}</span>${label}</button>`;
+
+  function homeView() {
+    const u = S.user, last = S.txs[0];
+    const today = new Date().toISOString().slice(0, 10);
+    const spent = S.txs.filter((t) => t.direction === 'debit' && t.created_at.startsWith(today)).reduce((s, t) => s + t.amount, 0);
+    const [whole, dec] = fmt(u.balance).split('.');
+    return `
+    <div class="top"><div class="avatar">${esc(u.firstName[0])}</div>
+      <div class="hi">Hi, ${esc(u.firstName.toUpperCase())}</div>${themeBtn()}</div>
+    <div class="balance">
+      <div class="row">
+        <div><div class="lbl">${I.shield} Available <button data-act="hide" aria-label="Show or hide balance" style="color:inherit">${S.hide ? I.eyeOff : I.eye}</button></div>
+          <div class="amount">${S.hide ? '₦ ••••••' : `₦${whole}<small>.${dec}</small>`}</div></div>
+        <button class="pill" data-act="topup">+ Add Money</button>
+      </div>
+      <div class="earn">Account ${esc(u.accountNumber)}</div>
+    </div>
+    <div class="last">${last ? `<span class="cr">●</span><span class="txt">${esc(last.description)} ${last.direction === 'credit' ? '+' : '-'}${naira(last.amount)}</span>` : '<span class="txt">No transactions yet</span>'}
+      <button class="link" data-act="history">Transactions ${I.chev.replace('<svg', '<svg width="14" height="14"')}</button></div>
+    <button class="strip" data-act="history"><span class="ic" style="color:var(--blue)">${I.coins.replace('<svg', '<svg width="22" height="22"')}</span>
+      <span class="grow">Today's Spending: <b>${S.hide ? '₦••••' : naira(spent)}</b></span>${I.chev.replace('<svg', '<svg width="18" height="18"')}</button>
+    <div class="panel"><div class="grid3">
+      ${act('tovault', I.user, 'To Vaultly')}${act('tobank', I.bank, 'To Bank')}${act('save', I.safe, 'Save')}
+    </div></div>
+    <div class="panel"><div class="grid4">
+      ${act('bill', I.phone, 'Airtime', 'data-cat="airtime"')}${act('bill', I.data, 'Data', 'data-cat="data"')}
+      ${act('bill', I.tv, 'TV', 'data-cat="tv"')}${act('bill', I.bolt, 'Electricity', 'data-cat="electricity"')}
+      ${act('go', I.piggy, 'Wealth', 'data-view="wealth"')}${act('save', I.coins, 'Spend & Save')}
+      ${act('go', I.gift, 'Invitation', 'data-view="rewards"')}${act('more', I.more, 'More')}
+    </div></div>
+    <div class="promo"><h3>Plan Your Dream Goal!</h3><div class="in"><div><b>Savings Target</b><p>Small savings today, big wins tomorrow.</p></div>
+      <button class="btn" data-act="save">Go</button></div></div>`;
+  }
+
+  function wealthView() {
+    const u = S.user;
+    return `<h1 class="pg">Wealth</h1>
+    <div class="balance" style="border-radius:22px;margin-bottom:14px"><div class="lbl">${I.safe} Savings balance</div>
+      <div class="amount">${S.hide ? '₦ ••••••' : naira(u.savings)}</div>
+      <div style="display:flex;gap:10px"><button class="pill" data-act="save">+ Save</button><button class="pill" data-act="unsave">Withdraw</button></div></div>
+    <div class="list">${S.txs.filter((t) => t.type === 'save').map(txRow).join('') || '<div class="empty">No savings activity yet.</div>'}</div>`;
+  }
+  function rewardsView() {
+    return `<h1 class="pg">Rewards</h1>
+    <div class="promo"><h3>Invite friends</h3><div class="in"><div><b>Your account number</b><p>${esc(S.user.accountNumber)}</p></div>
+      <button class="btn" data-act="copy">Copy</button></div></div>
+    <div class="empty">Referral bonuses will show up here once you connect a rewards programme.</div>`;
+  }
+  function meView() {
+    const u = S.user;
+    const row = (k, v) => `<div class="kv"><span>${k}</span><span>${esc(v)}</span></div>`;
+    const dark = document.documentElement.dataset.theme === 'dark';
+    return `<h1 class="pg">Me</h1>
+    <div style="margin-bottom:12px"><span class="badge">${I.shield.replace('<svg', '<svg width="14" height="14"')} Verified with NIN</span></div>
+    <div class="list">
+      ${row('Full name', u.fullName)}${row('Age', u.age + ' years')}${row('Date of birth', u.dob)}${row('Gender', u.gender === 'F' ? 'Female' : u.gender === 'M' ? 'Male' : '—')}
+      ${row('Address', u.address)}${row('NIN', '•••••••' + u.ninLast4)}${row('Phone', u.phone)}${row('Gmail', u.email)}${row('Account number', u.accountNumber)}
+    </div>
+    <div class="list"><button class="item" style="width:100%;text-align:left" data-act="theme"><div class="ic">${dark ? I.sun : I.moon}</div>
+      <div class="mid"><b>Theme</b><span>${dark ? 'Black & blue (tap for white & blue)' : 'White & blue (tap for black & blue)'}</span></div></button></div>
+    <button class="btn ghost block" data-act="logout">Log out</button>`;
+  }
+  function historyView() {
+    return `<h1 class="pg">Transactions</h1><div class="list">${S.txs.map(txRow).join('') || '<div class="empty">No transactions yet.</div>'}</div>`;
+  }
+
+  const TABS = [['home', 'Home', I.home], ['rewards', 'Rewards', I.star], ['wealth', 'Wealth', I.chart], ['me', 'Me', I.me]];
+  function render() {
+    const root = $('#app');
+    if (!S.token || !S.user) { root.innerHTML = authView(); return; }
+    const v = { home: homeView, wealth: wealthView, rewards: rewardsView, me: meView, history: historyView }[S.view] || homeView;
+    root.innerHTML = `<div class="app">${S.view === 'history' ? `<button class="link" data-act="go" data-view="home" style="margin-bottom:8px">← Back</button>` : ''}${v()}</div>
+      <nav class="tabs"><div>${TABS.map(([k, l, i]) => `<button class="tab ${S.view === k ? 'on' : ''}" data-act="go" data-view="${k}">${i}${l}</button>`).join('')}</div></nav>`;
+  }
+
+  /* ---------- bottom sheets ---------- */
+  function openSheet(html) {
+    $('#sheet-root').innerHTML = `<div class="overlay" data-act="overlay"><div class="sheet" role="dialog" aria-modal="true">
+      <button class="icon-btn x" data-act="close" aria-label="Close">${I.x}</button>${html}</div></div>`;
+    const first = $('#sheet-root input'); if (first) first.focus();
+  }
+  function closeSheet() { $('#sheet-root').innerHTML = ''; }
+  const errBox = () => `<div class="err" id="sheet-err" hidden></div>`;
+  function sheetErr(m) { const e = $('#sheet-err'); e.textContent = m; e.hidden = false; }
+  const amountField = () => `<div class="field"><label for="amt">Amount (₦)</label><input id="amt" type="number" inputmode="decimal" min="1" step="0.01" required></div>`;
+
+  function sheetTopup() {
+    openSheet(`<h2>Add money</h2><p class="sub">Demo mode: this credits your wallet instantly. Connect a payment gateway for real funding.</p>${errBox()}
+      <form data-form="topup">${amountField()}<button class="btn block">Add money</button></form>`);
+  }
+  function sheetTransfer(external) {
+    openSheet(`<h2>${external ? 'To Bank' : 'To Vaultly'}</h2>
+      <p class="sub">${external ? 'Send to another Vaultly account by its 10-digit account number. Other banks need a payments partner.' : 'Send money instantly to any Vaultly account.'}</p>${errBox()}
+      <form data-form="transfer">
+        <div class="field"><label for="acct">Account number</label><input id="acct" inputmode="numeric" maxlength="10" required></div>
+        <div id="recipient"></div>${amountField()}
+        <div class="field"><label for="note">Note (optional)</label><input id="note" maxlength="100"></div>
+        <button class="btn block">Send</button></form>`);
+  }
+  function sheetSave(out) {
+    openSheet(`<h2>${out ? 'Withdraw from savings' : 'Save money'}</h2>
+      <p class="sub">Savings balance: ${naira(S.user.savings)} · Wallet: ${naira(S.user.balance)}</p>${errBox()}
+      <form data-form="save" data-dir="${out ? 'out' : 'in'}">${amountField()}<button class="btn block">${out ? 'Withdraw' : 'Save'}</button></form>`);
+  }
+  const PROVIDERS = {
+    airtime: ['MTN', 'Airtel', 'Glo', '9mobile'], data: ['MTN', 'Airtel', 'Glo', '9mobile'],
+    tv: ['DStv', 'GOtv', 'StarTimes'], electricity: ['IKEDC', 'EKEDC', 'AEDC', 'PHED']
+  };
+  function sheetBill(cat) {
+    const label = { airtime: 'Airtime', data: 'Data', tv: 'TV', electricity: 'Electricity' }[cat];
+    openSheet(`<h2>${label}</h2><p class="sub">Demo mode: the payment is recorded but not sent to a provider.</p>${errBox()}
+      <form data-form="bill" data-cat="${cat}">
+        <div class="chips" id="providers">${PROVIDERS[cat].map((p, i) => `<button type="button" class="chip ${i ? '' : 'on'}" data-act="pick" data-p="${p}">${p}</button>`).join('')}</div>
+        <div class="field"><label for="target">${cat === 'tv' ? 'Smartcard number' : cat === 'electricity' ? 'Meter number' : 'Phone number'}</label><input id="target" inputmode="numeric" required></div>
+        ${amountField()}<button class="btn block">Pay</button></form>`);
+    $('#providers').dataset.value = PROVIDERS[cat][0];
+  }
+  function sheetMore() {
+    openSheet(`<h2>More</h2><p class="sub">Choose a service</p><div class="grid4" style="margin-top:8px">
+      ${act('bill', I.phone, 'Airtime', 'data-cat="airtime"')}${act('bill', I.data, 'Data', 'data-cat="data"')}
+      ${act('bill', I.tv, 'TV', 'data-cat="tv"')}${act('bill', I.bolt, 'Electricity', 'data-cat="electricity"')}</div>`);
+  }
+
+  /* ---------- events ---------- */
+  document.addEventListener('click', (e) => {
+    const el = e.target.closest('[data-act]'); if (!el) return;
+    const a = el.dataset.act;
+    if (a === 'overlay') { if (e.target === el) closeSheet(); return; }
+    const go = (v) => { S.view = v; closeSheet(); render(); window.scrollTo(0, 0); };
+    ({
+      theme: toggleTheme, close: closeSheet, go: () => go(el.dataset.view), history: () => go('history'),
+      logout: () => logout(), hide: () => { S.hide = !S.hide; store.set('hide', S.hide ? '1' : '0'); render(); },
+      switch: () => { S.authMode = S.authMode === 'login' ? 'register' : 'login'; S.error = ''; render(); },
+      topup: sheetTopup, tovault: () => sheetTransfer(false), tobank: () => sheetTransfer(true),
+      save: () => sheetSave(false), unsave: () => sheetSave(true), more: sheetMore,
+      bill: () => sheetBill(el.dataset.cat),
+      pick: () => { $$('.chip').forEach((c) => c.classList.remove('on')); el.classList.add('on'); $('#providers').dataset.value = el.dataset.p; },
+      copy: () => { navigator.clipboard?.writeText(S.user.accountNumber).then(() => toast('Account number copied'), () => toast(S.user.accountNumber)); }
+    })[a]?.();
+  });
+  const $$ = (s) => [...document.querySelectorAll(s)];
+
+  // look up the recipient name as the account number is typed
+  document.addEventListener('input', async (e) => {
+    if (e.target.id !== 'acct') return;
+    const box = $('#recipient'), v = e.target.value.replace(/\D/g, '');
+    if (v.length !== 10) { box.innerHTML = ''; return; }
+    try { const r = await api('/api/lookup?account=' + v); if (e.target.value === v) box.innerHTML = `<div class="recipient">${esc(r.name)}</div>`; }
+    catch (err) { box.innerHTML = `<div class="err">${esc(err.message)}</div>`; }
+  });
+
+  document.addEventListener('submit', async (e) => {
+    e.preventDefault();
+    const f = e.target, btn = f.querySelector('button.btn');
+    const val = (id) => (f.querySelector('#' + id)?.value || '').trim();
+    if (btn) btn.disabled = true;
+    try {
+      if (f.id === 'auth-form') {
+        S.busy = true; S.error = '';
+        const reg = S.authMode === 'register';
+        const body = reg ? { nin: val('nin'), phone: val('phone'), email: val('email'), password: f.querySelector('#password').value }
+                         : { identifier: val('identifier'), password: f.querySelector('#password').value };
+        const r = await api(reg ? '/api/auth/register' : '/api/auth/login', 'POST', body);
+        S.token = r.token; store.set('token', r.token); S.user = r.user; S.view = 'home'; S.busy = false;
+        S.txs = await api('/api/transactions'); render();
+        toast(reg ? `Welcome, ${r.user.firstName}! Account verified from your NIN.` : `Welcome back, ${r.user.firstName}`);
+        return;
+      }
+      const k = f.dataset.form, amount = val('amt');
+      const calls = {
+        topup: () => api('/api/topup', 'POST', { amount }),
+        transfer: () => api('/api/transfer', 'POST', { amount, accountNumber: val('acct'), note: val('note') }),
+        save: () => api('/api/save', 'POST', { amount, direction: f.dataset.dir }),
+        bill: () => api('/api/bills', 'POST', { amount, category: f.dataset.cat, provider: $('#providers').dataset.value, target: val('target') })
+      };
+      S.user = await calls[k]();
+      S.txs = await api('/api/transactions');
+      closeSheet(); render(); toast('Done ✓');
+    } catch (err) {
+      if (f.id === 'auth-form') { S.error = err.message; S.busy = false; render(); }
+      else { sheetErr(err.message); if (btn) btn.disabled = false; }
+    }
+  });
+  document.addEventListener('keydown', (e) => { if (e.key === 'Escape') closeSheet(); });
+
+  load();
+}
+
+const PAGES = {
+  '/': ['text/html; charset=utf-8', INDEX_HTML],
+  '/styles.css': ['text/css', STYLES_CSS],
+  '/theme.js': ['text/javascript', THEME_JS],
+  '/app.js': ['text/javascript', '(' + clientApp.toString() + ')();']
+};
+
+/* ---------- server ---------- */
+const SEC = {
+  'X-Content-Type-Options': 'nosniff', 'X-Frame-Options': 'DENY', 'Referrer-Policy': 'no-referrer',
+  'Content-Security-Policy': "default-src 'self'; style-src 'self' 'unsafe-inline'; img-src 'self' data:; frame-ancestors 'none'"
+};
+const send = (res, status, data, headers = {}) => {
+  const body = typeof data === 'string' || Buffer.isBuffer(data) ? data : JSON.stringify(data);
+  res.writeHead(status, { ...SEC, ...headers }); res.end(body);
+};
+const readBody = (req) => new Promise((ok, no) => {
+  let s = ''; req.on('data', (c) => { s += c; if (s.length > 1e5) { no(new HttpError(413, 'Too large')); req.destroy(); } });
+  req.on('end', () => { try { ok(s ? JSON.parse(s) : {}); } catch { no(new HttpError(400, 'Invalid JSON')); } });
+});
+
+http.createServer(async (req, res) => {
+  const url = new URL(req.url, 'http://x');
+  try {
+    if (url.pathname.startsWith('/api/')) {
+      const r = routes[`${req.method} ${url.pathname}`];
+      if (!r) throw new HttpError(404, 'Not found');
+      let uid = null;
+      if (r.auth) {
+        uid = verifyToken((req.headers.authorization || '').replace(/^Bearer /, ''));
+        if (!uid || !profile(uid)) throw new HttpError(401, 'Please log in again');
+      }
+      const body = req.method === 'POST' ? await readBody(req) : {};
+      const out = await r.fn({ uid, body, query: url.searchParams, ip: req.socket.remoteAddress });
+      return send(res, out.status || 200, out.data, { 'Content-Type': 'application/json', 'Cache-Control': 'no-store' });
+    }
+    const page = PAGES[url.pathname] || PAGES['/'];
+    send(res, 200, page[1], { 'Content-Type': page[0] });
+  } catch (e) {
+    if (!(e instanceof HttpError)) console.error(e);
+    send(res, e.status || 500, { error: e instanceof HttpError ? e.message : 'Something went wrong' }, { 'Content-Type': 'application/json' });
+  }
+}).listen(PORT, () => console.log(`Vaultly running on http://localhost:${PORT}  (NIN provider: ${PROVIDER})`));
