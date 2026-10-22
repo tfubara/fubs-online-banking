@@ -4,7 +4,7 @@ const http = require('node:http');
 const crypto = require('node:crypto');
 const { DatabaseSync } = require('node:sqlite');
 
-const PORT = 3000;
+const PORT = Number(process.env.PORT) || 3000;
 const DB_FILE = './fubs_banking.db';
 
 const db = new DatabaseSync(DB_FILE);
@@ -1064,8 +1064,7 @@ const server = http.createServer(async (req, res) => {
     res.end();
   }
 });
-
-server.listen(PORT, '127.0.0.1', () => {
+  server.listen(PORT, '0.0.0.0', () => {
   console.log('Fubs Online Banking demo is running.');
   console.log('Open http://localhost:' + PORT);
   console.log('Press Ctrl+C to stop the server.');
