@@ -2051,3 +2051,26 @@ http.createServer(async (req, res) => {
     `Fubs Online Banking running on http://localhost:${PORT} (demo app, not a real bank)`
   );
 });
+function ageFrom(dateOfBirth) {
+    if (!dateOfBirth) return 0;
+
+    const birthDate = new Date(dateOfBirth);
+    const today = new Date();
+
+    if (Number.isNaN(birthDate.getTime())) return 0;
+
+    let age = today.getFullYear() - birthDate.getFullYear();
+
+    const birthdayNotReached =
+        today.getMonth() < birthDate.getMonth() ||
+        (
+            today.getMonth() === birthDate.getMonth() &&
+            today.getDate() < birthDate.getDate()
+        );
+
+    if (birthdayNotReached) {
+        age--;
+    }
+
+    return age;
+}
