@@ -1,0 +1,10 @@
+.env
+node_modules/
+npm-debug.log*
+.DS_Store
+server.js.backup
+server.js.before_admin
+server.js.before_banking_features
+server.js.before_transfer_routes
+schema.sql.before_admin
+schema.sql.before_banking_features

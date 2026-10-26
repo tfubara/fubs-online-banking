@@ -1,0 +1,95 @@
+<!doctype html>
+<html lang="en">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <meta name="robots" content="noindex, nofollow">
+  <title>Administrator | Fubs Online Banking</title>
+  <link rel="stylesheet" href="/styles.css">
+  <link rel="stylesheet" href="/admin.css">
+  <script src="/admin.js" defer></script>
+</head>
+<body>
+  <header>
+    <a class="brand" href="/">FUBS <span>ADMINISTRATION</span></a>
+    <a class="secondary admin-home" href="/">Customer website</a>
+  </header>
+
+  <main class="shell admin-shell">
+    <section id="admin-login-panel" class="panel">
+      <div class="eyebrow">RESTRICTED ACCESS</div>
+      <h1>Administrator sign in</h1>
+      <p class="muted">
+        This area is for authorized application reviewers only.
+      </p>
+
+      <form id="admin-login-form">
+        <label for="admin-email">Administrator email</label>
+        <input
+          id="admin-email"
+          type="email"
+          autocomplete="username"
+          maxlength="254"
+          required
+        >
+
+        <label for="admin-password">Password</label>
+        <input
+          id="admin-password"
+          type="password"
+          autocomplete="current-password"
+          maxlength="128"
+          required
+        >
+
+        <button id="admin-login-button" class="primary full" type="submit">
+          Sign in
+        </button>
+      </form>
+
+      <div id="admin-login-message" class="message" role="status"></div>
+    </section>
+
+    <section id="admin-dashboard" class="hidden">
+      <div class="panel">
+        <div class="eyebrow">ADMINISTRATION</div>
+        <h1>Application review</h1>
+        <p class="muted">
+          Signed in as <strong id="admin-identity"></strong>
+        </p>
+
+        <div class="actions">
+          <button id="refresh-applications" class="primary" type="button">
+            Refresh applications
+          </button>
+          <button id="admin-logout" class="secondary" type="button">
+            Sign out
+          </button>
+        </div>
+
+        <div id="admin-dashboard-message" class="message" role="status"></div>
+      </div>
+
+      <section class="panel">
+        <h2>Pending applications</h2>
+        <p class="muted">
+          Review applications carefully. A decision changes the account
+          status in this development application; it does not complete
+          regulated identity checks or open a real bank account.
+        </p>
+
+        <div id="application-count" class="status">
+          <span>Applications awaiting review</span>
+          <strong>0</strong>
+        </div>
+
+        <div id="application-list" class="application-list">
+          <p class="muted">Loading applications…</p>
+        </div>
+      </section>
+    </section>
+  </main>
+
+  <footer>Fubs Online Banking · Administrator development dashboard</footer>
+</body>
+</html>

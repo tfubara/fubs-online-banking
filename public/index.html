@@ -1,0 +1,354 @@
+<!doctype html>
+<html lang="en">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <meta name="theme-color" content="#202321">
+  <title>Fubs Online Banking</title>
+  <link rel="stylesheet" href="/styles.css">
+  <script src="/app.js" defer></script>
+</head>
+<body>
+  <header class="app-header">
+    <a class="brand" href="/">FUBS <span>ONLINE BANKING</span></a>
+    <button id="theme" class="secondary" type="button">◐ Theme</button>
+  </header>
+
+  <main class="shell">
+
+    <!-- LOGIN AND REGISTRATION -->
+    <section id="auth" class="panel">
+      <div class="eyebrow">SECURE ACCOUNT ACCESS</div>
+      <h1 id="heading">Welcome to Fubs</h1>
+      <p class="muted">Sign in to access your Fubs demo account.</p>
+
+      <div class="actions">
+        <button id="login-tab" class="primary" type="button">Sign in</button>
+        <button id="register-tab" class="secondary" type="button">Create account</button>
+      </div>
+
+      <form id="login-form">
+	        <label for="login-email">Email address</label>
+        <input id="login-email" type="email" autocomplete="username" required maxlength="254">
+
+        <label for="login-password">Password</label>
+        <input id="login-password" type="password" autocomplete="current-password" required maxlength="128">
+
+        <button class="primary full" type="submit">Sign in →</button>
+      </form>
+
+      <form id="register-form" class="hidden">
+        <div class="stephead">
+          <strong id="step-label">Step 1 of 4</strong>
+          <div class="progress"><div id="progress-fill"></div></div>
+        </div>
+
+        <section class="reg-step" data-step="1">
+          <h2>1. Personal information</h2>
+          <p class="muted">NIN and BVN are not requested.</p>
+
+          <label for="firstName">First name</label>
+          <input id="firstName" required maxlength="80">
+
+          <label for="middleName">Middle name (optional)</label>
+          <input id="middleName" maxlength="80">
+
+          <label for="lastName">Last name</label>
+          <input id="lastName" required maxlength="80">
+
+          <label for="dob">Date of birth</label>
+          <input id="dob" type="date" required>
+
+          <label for="gender">Gender (optional)</label>
+          <select id="gender">
+            <option value="">Prefer not to say</option>
+            <option>Female</option>
+            <option>Male</option>
+            <option>Another identity</option>
+          </select>
+
+          <label for="country">Country</label>
+          <input id="country" value="Nigeria" required maxlength="80">
+
+          <label for="stateRegion">State / region</label>
+          <input id="stateRegion" required maxlength="100">
+
+          <label for="city">City</label>
+          <input id="city" required maxlength="100">
+
+          <label for="address">Residential address</label>
+          <input id="address" required maxlength="250">
+
+          <label for="postal">Postal code (optional)</label>
+          <input id="postal" maxlength="20">
+        </section>
+
+        <section class="reg-step hidden" data-step="2">
+          <h2>2. Contact and profile</h2>
+
+          <label for="email">Email address</label>
+          <input id="email" type="email" required maxlength="254">
+
+          <label for="phone">Phone number</label>
+          <input id="phone" type="tel" required maxlength="25">
+
+          <label for="occupation">Occupation (optional)</label>
+          <input id="occupation" maxlength="100">
+
+          <label for="employment">Employment status</label>
+          <select id="employment">
+            <option value="">Choose an option</option>
+            <option>Employed</option>
+            <option>Self-employed</option>
+            <option>Student</option>
+            <option>Unemployed</option>
+            <option>Retired</option>
+            <option>Other</option>
+          </select>
+        </section>
+
+        <section class="reg-step hidden" data-step="3">
+          <h2>3. Account security</h2>
+
+          <label for="password">Password (12+ characters)</label>
+          <input id="password" type="password" required minlength="12" maxlength="128" autocomplete="new-password">
+
+          <label for="confirmPassword">Confirm password</label>
+          <input id="confirmPassword" type="password" required minlength="12" maxlength="128" autocomplete="new-password">
+
+          <label for="pin">Six-digit transaction PIN</label>
+          <input id="pin" type="password" required inputmode="numeric" pattern="[0-9]{6}" maxlength="6" autocomplete="off">
+
+          <label for="confirmPin">Confirm transaction PIN</label>
+          <input id="confirmPin" type="password" required inputmode="numeric" pattern="[0-9]{6}" maxlength="6" autocomplete="off">
+
+          <p class="notice">This is a demo banking application, not a licensed bank.</p>
+        </section>
+
+        <section class="reg-step hidden" data-step="4">
+          <h2>4. Selfie and confirmation</h2>
+          <p class="muted">A selfie preview does not establish identity or verify a face.</p>
+
+          <div class="camera">
+            <video id="video" autoplay playsinline muted class="hidden"></video>
+            <img id="preview" class="hidden" alt="Selfie preview">
+            <div id="camera-placeholder">Open your camera to show a preview.</div>
+          </div>
+
+          <div class="actions">
+            <button id="open-camera" class="secondary" type="button">Open camera</button>
+            <button id="capture" class="primary" type="button" disabled>Capture selfie</button>
+            <button id="retake" class="secondary hidden" type="button">Retake</button>
+          </div>
+
+          <p id="camera-status" class="muted small" aria-live="polite"></p>
+
+          <label class="check">
+            <input id="terms" type="checkbox" required>
+            I understand this is not an active bank account.
+          </label>
+
+          <div id="summary" class="summary"></div>
+        </section>
+
+        <div class="actions split">
+          <button id="back" type="button" class="secondary hidden">Back</button>
+          <button id="next" type="button" class="primary">Continue</button>
+          <button id="submit" type="submit" class="primary hidden">Submit registration</button>
+        </div>
+      </form>
+
+      <div id="message" class="message" role="status"></div>
+    </section>
+
+    <!-- REDESIGNED DASHBOARD -->
+    <section id="dashboard" class="hidden">
+
+      <div class="welcome-row">
+        <div class="avatar-circle">F</div>
+        <div class="welcome-copy">
+          <span class="muted">Welcome back,</span>
+          <h1 id="dash-name">Fubs Customer</h1>
+        </div>
+        <button class="round-action" type="button" data-notice="Notifications are a demo feature." aria-label="Notifications">♧</button>
+        <button class="round-action" type="button" data-notice="Help centre coming soon." aria-label="Help">?</button>
+      </div>
+
+      <!-- BALANCE CARD -->
+      <section class="balance-card">
+        <div class="balance-top">
+          <span>◆ Available balance</span>
+          <button id="toggle-balance" type="button" class="balance-eye" aria-label="Hide or show balance">◉</button>
+        </div>
+
+        <div id="balance-value" class="balance-value">₦0.00</div>
+        <div id="banking-status"></div>
+        <div class="balance-bottom">
+          <span>Fubs demo account</span>
+          <button type="button" class="add-money-button" id="add-demo-money">＋ Add Demo Money</button>
+        </div>
+
+        <div class="balance-account">
+          Account number: <strong id="account-number"></strong>
+          <span id="account-status"></span>
+        </div>
+
+        <p class="balance-disclaimer">Demo balance only · Not connected to a real bank</p>
+      </section>
+
+      <!-- ACTIVITY STRIP -->
+      <button class="activity-strip" type="button" data-target="transactions-panel">
+        <span class="activity-check">✓</span>
+        <span>Account activity</span>
+        <span class="activity-link">Transactions ›</span>
+      </button>
+
+      <!-- BUSINESS SERVICE -->
+      <button class="business-strip" type="button" data-notice="Business services are not connected yet.">
+        <span class="business-icon">▦</span>
+        <span>Business services</span>
+        <span class="business-value">Demo</span>
+        <span class="arrow">›</span>
+      </button>
+
+      <!-- PRIMARY ACTIONS -->
+      <section class="service-card primary-services">
+        <button class="service-button" type="button" data-target="transfer-panel">
+          <span class="service-icon green-icon">♙</span>
+          <span>To Fubs</span>
+        </button>
+
+        <button class="service-button" type="button" data-target="transfer-panel">
+          <span class="service-icon green-icon">▤</span>
+          <span>To Bank</span>
+        </button>
+
+        <button class="service-button" type="button" data-notice="Savings features are not connected yet.">
+          <span class="service-icon green-icon">▣</span>
+          <span>Save</span>
+        </button>
+      </section>
+
+      <!-- MORE SERVICES -->
+      <section class="service-card more-services">
+        <button class="service-button" type="button" data-notice="Airtime purchases are not enabled.">
+          <span class="service-icon">▥</span>
+          <span>Airtime</span>
+        </button>
+
+        <button class="service-button" type="button" data-notice="Data purchases are not enabled.">
+          <span class="service-icon">⇅</span>
+          <span>Data</span>
+        </button>
+
+        <button class="service-button" type="button" data-notice="TV payments are not enabled.">
+          <span class="service-icon">▷</span>
+          <span>TV</span>
+        </button>
+
+        <button class="service-button" type="button" data-notice="Electricity payments are not enabled.">
+          <span class="service-icon">ϟ</span>
+          <span>Electricity</span>
+        </button>
+
+        <button class="service-button" type="button" data-notice="Wealth services are not enabled.">
+          <span class="service-icon">♙</span>
+          <span>Wealth</span>
+        </button>
+
+        <button class="service-button" type="button" data-notice="Savings features are not enabled.">
+          <span class="service-icon">₦</span>
+          <span>Spend &amp; Save</span>
+        </button>
+
+        <button class="service-button" type="button" data-notice="Invitations are coming soon.">
+          <span class="service-icon">↗</span>
+          <span>Invitation</span>
+        </button>
+
+        <button class="service-button" type="button" data-notice="More services coming soon.">
+          <span class="service-icon">•••</span>
+          <span>More</span>
+        </button>
+      </section>
+
+      <!-- PROMOTION -->
+      <section class="promo-card">
+        <span class="promo-label">YOUR FINANCIAL JOURNEY</span>
+        <h2>Plan Your Future</h2>
+        <p>Small steps today. Bigger goals tomorrow.</p>
+        
+      </section>
+
+      <!-- TRANSFER PANEL -->
+      <section id="transfer-panel" class="panel dashboard-panel">
+        <h2>Transfer to a Fubs account</h2>
+        <p class="muted">Internal demo transfers only. No real-money transfers are performed.</p>
+
+        <label for="recipient-account">Recipient account number</label>
+        <div class="inline-form">
+          <input id="recipient-account" inputmode="numeric" maxlength="10" placeholder="10-digit account number">
+          <button id="find-recipient" class="secondary" type="button">Find</button>
+        </div>
+
+        <p id="recipient-result" class="muted">No recipient selected.</p>
+
+        <label for="transfer-amount">Amount (NGN)</label>
+        <input id="transfer-amount" type="number" min="0.01" step="0.01" placeholder="0.00">
+
+        <label for="transfer-pin">Six-digit transaction PIN</label>
+        <input id="transfer-pin" type="password" inputmode="numeric" maxlength="6" placeholder="••••••">
+
+        <button id="submit-transfer" class="primary full" type="button">Submit demo transfer</button>
+        <p id="transfer-message" class="message" role="status"></p>
+      </section>
+
+      <!-- BENEFICIARIES -->
+      <section class="panel dashboard-panel">
+        <h2>Saved beneficiaries</h2>
+        <label for="beneficiary-account">Fubs account number</label>
+        <input id="beneficiary-account" inputmode="numeric" maxlength="10" placeholder="10-digit account number">
+        <button id="save-beneficiary" class="secondary" type="button">Save beneficiary</button>
+        <div id="beneficiaries-list" class="beneficiaries-list">No saved beneficiaries loaded.</div>
+      </section>
+
+      <!-- ACCOUNT AND TRANSACTIONS -->
+      <section class="panel dashboard-panel">
+        <h2>Account details</h2>
+        <div id="profile"></div>
+        <button id="refresh-account" class="secondary full" type="button">Refresh account and transactions</button>
+        <button id="logout" class="secondary full" type="button">Sign out</button>
+      </section>
+
+      <section id="transactions-panel" class="panel dashboard-panel">
+        <h2>Recent transactions</h2>
+        <p class="muted">Only actual records from your demo ledger are shown.</p>
+        <div id="transactions">No transactions recorded.</div>
+      </section>
+
+      <div id="dashboard-message" class="message" role="status"></div>
+
+      <!-- BOTTOM NAVIGATION -->
+      <nav class="bottom-nav" aria-label="Main navigation">
+        <button class="nav-item active" type="button" data-target="dashboard">
+          <span>◉</span><small>Home</small>
+        </button>
+        <button class="nav-item" type="button" data-notice="Rewards are coming soon.">
+          <span>◇</span><small>Rewards</small>
+        </button>
+        <button class="nav-item" type="button" data-notice="Wealth services are not connected.">
+          <span>⌁</span><small>Wealth</small>
+        </button>
+        <button class="nav-item" type="button" data-notice="Cards are not available in this demo.">
+          <span>▱</span><small>Cards</small>
+        </button>
+        <button class="nav-item" type="button" data-target="profile">
+          <span>☻</span><small>Me</small>
+        </button>
+      </nav>
+    </section>
+  </main>
+
+  <footer>Fubs Online Banking · Demo application</footer>
+</body>
+</html>
