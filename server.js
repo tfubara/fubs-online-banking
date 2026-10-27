@@ -55,7 +55,7 @@ function auth(req,res,next) { if (!req.session.userId) return res.status(401).js
 async function newAccountNumber(client,userId) {
   for (let i=0;i<5;i++) {
     const n=String(1000000000+crypto.randomInt(0,9000000000));
-    try { await client.query("INSERT INTO accounts(user_id,account_number,status) VALUES($1,$2,'pending')",[userId,n]); return n; }
+    try { await client.query("INSERT INTO accounts(user_id,account_number,status) VALUES($1,$2,'active')",[userId,n]); return n; }
     catch(e) { if(e.code!=='23505') throw e; }
   }
   throw new Error('Could not allocate account number.');
@@ -74,7 +74,7 @@ app.post('/api/auth/register', async (req,res) => {
     const duplicate=await client.query('SELECT id FROM users WHERE email=$1 OR phone=$2',[d.email,d.phone]);
     if(duplicate.rowCount){await client.query('ROLLBACK');return res.status(409).json({error:'An account using that email or phone already exists.'});}
     const passwordHash=await bcrypt.hash(d.password,12), pinHash=await bcrypt.hash(d.transactionPin,12);
-    const created=await client.query(`INSERT INTO users(first_name,middle_name,last_name,date_of_birth,gender,country,state_region,city,residential_address,postal_code,occupation,employment_status,email,phone,password_hash,transaction_pin_hash,terms_accepted_at,face_verification_status,account_status) VALUES($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12,$13,$14,$15,$16,NOW(),'not_configured','pending_review') RETURNING id`,[d.firstName,d.middleName||null,d.lastName,d.dateOfBirth,d.gender||null,d.country,d.stateRegion,d.city,d.residentialAddress,d.postalCode||null,d.occupation||null,d.employmentStatus||null,d.email,d.phone,passwordHash,pinHash]);
+    const created=await client.query(`INSERT INTO users(first_name,middle_name,last_name,date_of_birth,gender,country,state_region,city,residential_address,postal_code,occupation,employment_status,email,phone,password_hash,transaction_pin_hash,terms_accepted_at,face_verification_status,account_status) VALUES($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12,$13,$14,$15,$16,NOW(),'not_configured','active') RETURNING id`,[d.firstName,d.middleName||null,d.lastName,d.dateOfBirth,d.gender||null,d.country,d.stateRegion,d.city,d.residentialAddress,d.postalCode||null,d.occupation||null,d.employmentStatus||null,d.email,d.phone,passwordHash,pinHash]);
     const userId=created.rows[0].id;
     await newAccountNumber(client,userId);
     await client.query("INSERT INTO audit_events(actor_user_id,event_type,outcome,metadata) VALUES($1,'registration_created','pending',$2::jsonb)",[userId,JSON.stringify({email:d.email,faceVerification:'not_configured'})]);
